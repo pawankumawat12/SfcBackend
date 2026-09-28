@@ -463,9 +463,14 @@ async function getGuestCartPreview(req, res) {
         "products.images",
         "products.is_active",
         "products.category_id",
+        "products.store_id",
         "categories.name as category_name",
+        "stores.name as store_name",
+        "stores.is_open as store_is_open",
+        "stores.is_active as store_is_active",
       ])
       .leftJoin("categories", "products.category_id", "categories.id")
+      .leftJoin("stores", "products.store_id", "stores.id")
       .whereIn("products.id", productIds);
 
     const productMap = new Map(products.map((p) => [Number(p.product_id), p]));
