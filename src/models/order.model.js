@@ -828,6 +828,15 @@ async function updateOrderStatus(orderId, status) {
     throw new Error("Order not found");
   }
 
+  // Critical Guard: Once an order is Cancelled, its status is immutable and cannot be modified by anyone
+  if (order.status === "Cancelled") {
+    const err = new Error(
+      "Cannot change status: This order was cancelled and its status cannot be modified."
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
   // Guard: Cannot advance unpaid online order to in-progress or completed states
   if (
     order.payment_method !== "Cash on Delivery" &&
@@ -987,6 +996,15 @@ async function acceptOrder(orderId, { notes = null } = {}) {
     throw new Error("Order not found");
   }
 
+  // Guard: Cancelled orders cannot be accepted by admin or store owner
+  if (order.status === "Cancelled") {
+    const err = new Error(
+      "Cannot accept order: This order was cancelled and cannot be accepted."
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
   // Guard: Unpaid online payment orders cannot be accepted or prepared
   if (order.payment_method !== "Cash on Delivery" && order.payment_status !== "Paid") {
     const err = new Error(
@@ -1014,6 +1032,15 @@ async function acceptOrder(orderId, { notes = null } = {}) {
 }
 
 async function rejectOrder(orderId, { cancelReason = "Order rejected by store" } = {}) {
+  const order = await db("orders").where({ id: orderId }).first();
+  if (!order) {
+    throw new Error("Order not found");
+  }
+  if (order.status === "Cancelled") {
+    const err = new Error("This order is already cancelled.");
+    err.statusCode = 400;
+    throw err;
+  }
   return cancelOrder(orderId, cancelReason);
 }
 
@@ -1031,6 +1058,16 @@ async function bulkUpdateOrderStatus(ids, targetStatus, { cancelReason = "Cancel
   const otherSkipped = [];
 
   for (const order of orders) {
+    // Critical Guard: Cancelled orders can never be changed in bulk
+    if (order.status === "Cancelled") {
+      otherSkipped.push({
+        id: order.id,
+        orderNumber: order.order_number,
+        reason: "Order was cancelled and its status is locked",
+      });
+      continue;
+    }
+
     // Payment Guardrail: cannot advance unpaid online orders to in-progress or fulfilled states
     const isUnpaidOnline =
       order.payment_method === "Online Payment" && order.payment_status !== "Paid";

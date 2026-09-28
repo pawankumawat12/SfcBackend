@@ -670,14 +670,34 @@ async function verifyRazorpayPayment(req, res) {
     });
   }
 }
+function attachCancellationMeta(order, userRole) {
+  if (!order) return order;
+  const cancelableStatuses = ["Pending", "Order Placed", "Pending Payment"];
+  const isEligibleStatus = cancelableStatuses.includes(order.status);
+
+  return {
+    ...order,
+    cancellation: {
+      canCancel:
+        userRole === "admin"
+          ? order.status !== "Cancelled" && order.status !== "Completed" && order.status !== "Delivered"
+          : isEligibleStatus,
+      isEligibleStatus,
+    },
+  };
+}
+
 async function getUserOrders(req, res) {
   try {
     const { page, limit, status } = req.query || {};
     const result = await findOrdersByUser(req.user.id, { page, limit, status });
+    const enrichedOrders = (result.orders || []).map((o) =>
+      attachCancellationMeta(o, req.user?.role)
+    );
     return res.status(200).json({
       success: true,
       message: "Orders fetched successfully",
-      data: result.orders,
+      data: enrichedOrders,
       pagination: result.pagination,
     });
   } catch (error) {
@@ -722,10 +742,12 @@ async function getOrderDetails(req, res) {
       });
     }
 
+    const enrichedOrder = attachCancellationMeta(order, req.user?.role);
+
     return res.status(200).json({
       success: true,
       message: "Order details fetched successfully",
-      data: order,
+      data: enrichedOrder,
     });
   } catch (error) {
     console.error("Get order details error:", error);
@@ -802,10 +824,25 @@ async function updateStatus(req, res) {
       });
     }
 
+    const existing = await findOrderById(orderId, null);
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // Critical Guard: Cancelled orders are immutable
+    if (existing.status === "Cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This order has been cancelled and its status cannot be modified.",
+      });
+    }
+
     if (req.user.role === "store_owner") {
       const userStoreId = await getStoreIdForUser(req.user);
-      const existing = await findOrderById(orderId, null);
-      if (!existing || existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
+      if (existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
         return res.status(403).json({
           success: false,
           message: "Access denied: order does not belong to your store or is not dispatched.",
@@ -853,7 +890,7 @@ async function updateStatus(req, res) {
     console.error("Update order status error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to update order status",
+      message: error.message || "Failed to update order status",
     });
   }
 }
@@ -863,10 +900,25 @@ async function acceptOrderController(req, res) {
     const orderId = Number(req.params.id);
     const { notes } = req.body || {};
 
+    const existing = await findOrderById(orderId, null);
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // Critical Guard: Cancelled orders cannot be accepted
+    if (existing.status === "Cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This order was cancelled by the customer and cannot be accepted.",
+      });
+    }
+
     if (req.user.role === "store_owner") {
       const userStoreId = await getStoreIdForUser(req.user);
-      const existing = await findOrderById(orderId, null);
-      if (!existing || existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
+      if (existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
         return res.status(403).json({
           success: false,
           message: "Access denied: order does not belong to your store or is not dispatched.",
@@ -932,9 +984,23 @@ async function rejectOrderController(req, res) {
     const orderId = Number(req.params.id);
     const { cancelReason = "Order rejected by store" } = req.body || {};
 
+    const existing = await findOrderById(orderId, null);
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    if (existing.status === "Cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This order is already cancelled.",
+      });
+    }
+
     if (req.user.role === "store_owner") {
       const userStoreId = await getStoreIdForUser(req.user);
-      const existing = await findOrderById(orderId, null);
       if (!existing || existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
         return res.status(403).json({
           success: false,
@@ -1106,41 +1172,133 @@ async function markItemProduced(req, res) {
 async function cancelUserOrder(req, res) {
   try {
     const orderId = Number(req.params.id);
-    const { cancelReason } = req.body;
+    const { cancelReason = "Cancelled by customer within grace window" } = req.body || {};
 
     if (!orderId) {
       return res.status(400).json({ success: false, message: "Invalid order ID" });
     }
-    if (!cancelReason) {
-      return res.status(400).json({ success: false, message: "Cancel reason is required" });
+
+    const existingOrder = await db("orders").where({ id: orderId }).first();
+    if (!existingOrder) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const isAdminUser = req.user.role === "admin";
+    if (!isAdminUser && Number(existingOrder.user_id) !== Number(req.user.id)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to cancel this order",
+      });
+    }
+
+    // 1. Status eligibility check: Only Pending or Order Placed orders (not yet accepted/in processing) can be cancelled by customer
+    const cancelableStatuses = ["Pending", "Order Placed", "Pending Payment"];
+    if (!isAdminUser && !cancelableStatuses.includes(existingOrder.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Order cannot be cancelled because it is already in processing (${existingOrder.status}).`,
+      });
     }
 
     const updated = await cancelOrder(orderId, cancelReason);
+
+    // 2. If customer paid online via Razorpay, auto-initiate full refund
+    let refundInfo = null;
+    if (existingOrder.payment_status === "Paid" && existingOrder.payment_id) {
+      try {
+        const totalAmount = Number(existingOrder.total || existingOrder.grand_total);
+        const refundRes = await initiateRazorpayRefund(
+          existingOrder.payment_id,
+          totalAmount,
+          `Customer cancelled order #${existingOrder.order_number || existingOrder.id}`
+        );
+        refundInfo = refundRes;
+        await handleRefundProcessed(existingOrder.id, refundRes.id, totalAmount);
+      } catch (rfErr) {
+        console.warn("[Cancel Order] Automatic online refund notice:", rfErr.message);
+      }
+    }
 
     // Notify Admin
     await notificationModel.createNotification({
       role: "admin",
       type: "order_status",
       title: `Order Cancelled by Customer: #${updated.order_number || updated.id}`,
-      message: `Customer cancelled order. Reason: ${cancelReason}`,
+      message: `Customer cancelled order before processing. Reason: ${cancelReason}`,
       orderId: updated.id,
       dataJson: { orderId: updated.id, cancelReason },
     });
 
+    // Real-time broadcast to Admin & Store Owners
     emitToAdmin("admin_order_cancelled", {
       orderId: updated.id,
       orderNumber: updated.order_number || `#SFC-${updated.id}`,
       cancelReason,
+      order: updated,
     });
 
     emitToAdmin("admin_order_updated", {
+      order: updated,
+      orderId: updated.id,
+      status: "Cancelled",
+    });
+
+    emitToAdmin("admin_order_status_updated", {
+      orderId: updated.id,
+      orderNumber: updated.order_number || `#SFC-${updated.id}`,
+      status: "Cancelled",
+      order: updated,
+    });
+
+    // If order is dispatched to a store, ensure store owner's personal room receives the live cancellation
+    if (existingOrder.store_id) {
+      try {
+        const storeRecord = await db("stores").where({ id: existingOrder.store_id }).first();
+        if (storeRecord && storeRecord.owner_id) {
+          emitToUser(storeRecord.owner_id, "admin_order_cancelled", {
+            orderId: updated.id,
+            orderNumber: updated.order_number || `#SFC-${updated.id}`,
+            cancelReason,
+            order: updated,
+          });
+          emitToUser(storeRecord.owner_id, "admin_order_updated", {
+            order: updated,
+            orderId: updated.id,
+            status: "Cancelled",
+          });
+        }
+      } catch (storeNotifyErr) {
+        console.warn("[Cancel Order] Store owner notify error:", storeNotifyErr.message);
+      }
+    }
+
+    // Real-time live update to customer
+    emitToUser(existingOrder.user_id, "order_status_updated", {
+      orderId: updated.id,
+      orderNumber: updated.order_number || `#SFC-${updated.id}`,
+      status: "Cancelled",
+      order: updated,
+    });
+
+    emitToUser(existingOrder.user_id, "order_cancelled", {
+      orderId: updated.id,
+      orderNumber: updated.order_number || `#SFC-${updated.id}`,
+      status: "Cancelled",
+      cancelReason,
+      order: updated,
+    });
+
+    emitToOrder(updated.id, "order_status_updated", {
+      orderId: updated.id,
+      status: "Cancelled",
       order: updated,
     });
 
     return res.status(200).json({
       success: true,
-      message: "Order cancelled successfully",
+      message: "Order cancelled successfully.",
       data: updated,
+      refund: refundInfo,
     });
   } catch (error) {
     console.error("Cancel order error:", error);
