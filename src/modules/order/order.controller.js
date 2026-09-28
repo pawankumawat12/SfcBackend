@@ -407,30 +407,11 @@ async function createOrder(req, res) {
       }
     );
 
-    // 10.1 FCM PUSH NOTIFICATION TO ADMIN (Non-blocking / Decoupled)
-    // For online orders, push is triggered once payment succeeds via notifyPaymentSuccess to prevent duplicate pushes
     const isCod =
       String(paymentMethod).trim().toLowerCase() === "cash on delivery" ||
       String(paymentMethod).trim().toLowerCase() === "cod";
 
     if (isCod) {
-      try {
-        const fcmNotificationService = require("../../services/fcmNotification.service");
-        setImmediate(() => {
-          fcmNotificationService
-            .sendAdminNewOrderNotification({
-              orderId: order.id,
-              orderNumber: order.order_number || String(order.id),
-              totalAmount: order.total_amount,
-              customerName: finalCustomerName,
-            })
-            .catch((err) =>
-              console.error("[FCM Push Service Error]:", err.message)
-            );
-        });
-      } catch (fcmErr) {
-        console.error("[FCM Push Service Init Error]:", fcmErr.message);
-      }
 
       // Automated WhatsApp Order Alert (Store Owner or Admin based on dispatch permission)
       try {
@@ -1207,11 +1188,13 @@ async function cancelUserOrder(req, res) {
     if (existingOrder.payment_status === "Paid" && existingOrder.payment_id) {
       try {
         const totalAmount = Number(existingOrder.total || existingOrder.grand_total);
-        const refundRes = await initiateRazorpayRefund(
-          existingOrder.payment_id,
-          totalAmount,
-          `Customer cancelled order #${existingOrder.order_number || existingOrder.id}`
-        );
+        const refundRes = await initiateRazorpayRefund({
+          paymentId: existingOrder.payment_id || existingOrder.transaction_id,
+          amount: totalAmount,
+          notes: {
+            reason: `Customer cancelled order #${existingOrder.order_number || existingOrder.id}`,
+          },
+        });
         refundInfo = refundRes;
         await handleRefundProcessed(existingOrder.id, refundRes.id, totalAmount);
       } catch (rfErr) {

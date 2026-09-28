@@ -92,27 +92,6 @@ async function notifyPaymentSuccess(order, paymentId, source = "api") {
       orderStatus: order.status,
     });
 
-    // 6. Admin Push Notification (FCM - Non-blocking / Decoupled)
-    try {
-      const fcmNotificationService = require("./fcmNotification.service");
-      setImmediate(() => {
-        fcmNotificationService
-          .sendAdminNewOrderNotification({
-            orderId: order.id,
-            orderNumber,
-            totalAmount: order.total_amount,
-            customerName: order.customer_name || "Customer",
-          })
-          .catch((pushErr) =>
-            console.error(
-              "[FCM Push Service Error in notifyPaymentSuccess]:",
-              pushErr.message
-            )
-          );
-      });
-    } catch (fcmErr) {
-      console.error("[FCM Push Service Error]:", fcmErr.message);
-    }
 
     // Automated WhatsApp Order Alert for Online Paid Orders
     try {

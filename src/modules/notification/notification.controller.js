@@ -88,59 +88,9 @@ async function markAllRead(req, res) {
   }
 }
 
-async function registerAdminDeviceToken(req, res) {
-  try {
-    const user = req.user;
-    if (user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
-
-    const { token, deviceType, deviceInfo } = req.body;
-    if (!token) {
-      return res.status(400).json({ success: false, message: "Token is required" });
-    }
-
-    const fcmService = require("../../services/fcmNotification.service");
-    const result = await fcmService.registerAdminToken({
-      userId: user.id,
-      token,
-      deviceType: deviceType || "web",
-      deviceInfo: deviceInfo || req.headers["user-agent"] || null,
-    });
-
-    return res.status(200).json(result);
-  } catch (error) {
-    console.error("Error registering admin device token:", error);
-    return res.status(500).json({ success: false, message: "Failed to register token" });
-  }
-}
-
-async function unregisterAdminDeviceToken(req, res) {
-  try {
-    const user = req.user;
-    if (user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
-
-    const { token } = req.body;
-    if (!token) {
-      return res.status(400).json({ success: false, message: "Token is required" });
-    }
-
-    const fcmService = require("../../services/fcmNotification.service");
-    const result = await fcmService.unregisterAdminToken({ token });
-    return res.status(200).json(result);
-  } catch (error) {
-    console.error("Error unregistering admin device token:", error);
-    return res.status(500).json({ success: false, message: "Failed to unregister token" });
-  }
-}
-
 module.exports = {
   listNotifications,
   getUnreadCount,
   markRead,
   markAllRead,
-  registerAdminDeviceToken,
-  unregisterAdminDeviceToken,
 };
