@@ -456,6 +456,32 @@ function getOrderChatStatus(order) {
   };
 }
 
+let cachedAdminContact = null;
+let lastAdminContactFetch = 0;
+async function getAdminContactInfo() {
+  const now = Date.now();
+  if (cachedAdminContact && now - lastAdminContactFetch < 60000) {
+    return cachedAdminContact;
+  }
+  try {
+    const { getFooterSettings } = require("./settings.model");
+    const footer = await getFooterSettings();
+    cachedAdminContact = {
+      admin_address: footer?.location || "SFC Bakers Central Kitchen & Main Bakery",
+      admin_phone: footer?.phone_number || "",
+      admin_email: footer?.email || "",
+    };
+    lastAdminContactFetch = now;
+  } catch (err) {
+    cachedAdminContact = {
+      admin_address: "SFC Bakers Central Kitchen & Main Bakery",
+      admin_phone: "",
+      admin_email: "",
+    };
+  }
+  return cachedAdminContact;
+}
+
 function formatOrderRow(order) {
   if (!order) return null;
   let deliveryAddressJson = order.delivery_address_json;
@@ -518,9 +544,10 @@ async function findOrdersByUser(userId, { page = 1, limit = 10, status = null } 
     countQuery = countQuery.where("o.status", status);
   }
 
-  const [orders, countRow] = await Promise.all([
+  const [orders, countRow, adminContact] = await Promise.all([
     query.orderBy("o.created_at", "desc").limit(l).offset(offset),
     countQuery.count("o.id as count").first(),
+    getAdminContactInfo(),
   ]);
 
   const total = Number(countRow?.count || 0);
@@ -551,6 +578,9 @@ async function findOrdersByUser(userId, { page = 1, limit = 10, status = null } 
   return {
     orders: orders.map((o) => ({
       ...formatOrderRow(o),
+      admin_address: adminContact.admin_address,
+      admin_phone: adminContact.admin_phone,
+      admin_email: adminContact.admin_email,
       items: itemsByOrder[o.id] || [],
     })),
     pagination: {
@@ -586,7 +616,10 @@ async function findOrderById(orderId, userId = null) {
   if (userId) {
     query = query.where("o.user_id", userId);
   }
-  const order = await query.first();
+  const [order, adminContact] = await Promise.all([
+    query.first(),
+    getAdminContactInfo(),
+  ]);
   if (!order) return null;
 
   const items = await db("order_items")
@@ -595,6 +628,9 @@ async function findOrderById(orderId, userId = null) {
 
   return {
     ...formatOrderRow(order),
+    admin_address: adminContact.admin_address,
+    admin_phone: adminContact.admin_phone,
+    admin_email: adminContact.admin_email,
     items,
   };
 }
