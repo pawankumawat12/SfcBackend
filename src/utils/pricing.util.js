@@ -321,17 +321,17 @@ async function calculateCartAndOrderPricing({
           if (itemStoreId !== activeStoreId) {
             cannotDeliver = true;
             cannotDeliverReason = itemStoreId != null
-              ? `Ye product dusre store (${item.store_name || "Branch"}) ka hai aur is location per deliver nahi ho sakta. Please ise remove karein.`
-              : `Ye product Main Bakery ka hai aur aapki location (${activeStore?.name || "Branch"}) se deliver nahi ho sakta. Please ise remove karein.`;
+              ? `This item is from "${item.store_name || "another branch"}" and cannot be delivered to your selected address. Please remove it to continue.`
+              : `This item is from the Main Bakery and cannot be delivered to your selected address via "${activeStore?.name || "this branch"}". Please remove it to continue.`;
           }
         } else {
           // Fulfilling store is Admin (Main Bakery)
           if (itemStoreId != null) {
             cannotDeliver = true;
-            cannotDeliverReason = `Ye product dusre store (${item.store_name || "Branch"}) ka hai aur is location per deliver nahi ho sakta. Please ise remove karein.`;
+            cannotDeliverReason = `This item is from "${item.store_name || "a branch"}" and cannot be delivered to your selected address. Please remove it to continue.`;
           } else if (maxDeliveryDistance > 0 && distanceKm != null && distanceKm > maxDeliveryDistance) {
             cannotDeliver = true;
-            cannotDeliverReason = `Aapka delivery address hamari maximum delivery limit (${maxDeliveryDistance} km) se bahar hai (${distanceKm} km). Please ise remove karein.`;
+            cannotDeliverReason = `Sorry, we cannot deliver to your selected address. Please choose a closer location or remove this item.`;
           }
         }
       }

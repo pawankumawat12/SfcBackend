@@ -169,8 +169,18 @@ async function getProductById(req, res) {
 async function createProductHandler(req, res) {
   let uploadedResults = [];
   try {
-    const { name, description, price, stock, availabilityType, categoryId, isActive, images: bodyImages } =
-      req.body || {};
+    const {
+      name,
+      description,
+      price,
+      stock,
+      availabilityType,
+      categoryId,
+      isActive,
+      images: bodyImages,
+      store_id: bodyStoreId,
+      storeId: bodyStoreIdCamel,
+    } = req.body || {};
 
     let initialImages = [];
     if (req.files && req.files.length > 0) {
@@ -211,7 +221,7 @@ async function createProductHandler(req, res) {
       });
     }
 
-    // Strict category restriction and location check for Store Owner
+    // Associate store_id: Store Owner gets their own store, Admin can assign to any store
     if (req.user && req.user.role === "store_owner") {
       const storeId = req.user.store_id;
       if (!storeId) {
@@ -241,6 +251,32 @@ async function createProductHandler(req, res) {
       }
 
       data.store_id = storeId;
+    } else if (req.user && req.user.role === "admin") {
+      const rawStoreId = bodyStoreId || bodyStoreIdCamel;
+      if (rawStoreId && rawStoreId !== "admin" && rawStoreId !== "null" && rawStoreId !== "") {
+        const parsedStoreId = Number(rawStoreId);
+        if (!Number.isInteger(parsedStoreId) || parsedStoreId <= 0) {
+          return res.status(400).json({ message: "Invalid store ID provided" });
+        }
+        const targetStore = await db("stores").where({ id: parsedStoreId }).first();
+        if (!targetStore) {
+          return res.status(404).json({ message: "Selected store not found" });
+        }
+        data.store_id = parsedStoreId;
+
+        // Ensure the store has this category associated in store_categories
+        const hasCategoryAssoc = await db("store_categories")
+          .where({ store_id: parsedStoreId, category_id: data.category_id })
+          .first();
+        if (!hasCategoryAssoc) {
+          await db("store_categories")
+            .insert({
+              store_id: parsedStoreId,
+              category_id: data.category_id,
+            })
+            .catch(() => {});
+        }
+      }
     }
 
     if (req.files && req.files.length > 0) {
@@ -254,7 +290,7 @@ async function createProductHandler(req, res) {
       data.image_keys = [];
     }
 
-    data.storage_provider = "cloudinary";
+    data.storage_provider = uploadedResults[0]?.provider || "cloudinary";
 
     const product = await createProduct(data);
     const productWithCategory = await findProductById(product.id);
@@ -272,11 +308,11 @@ async function createProductHandler(req, res) {
 
     if (error.code === "23503") {
       return res.status(400).json({
-        message: "Invalid category reference",
+        message: "Invalid category or store reference",
       });
     }
 
-    return res.status(500).json({ message: "Server error" });
+    return res.status(500).json({ message: error.message || "Server error" });
   }
 }
 
