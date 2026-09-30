@@ -1,6 +1,6 @@
 const express = require("express");
 const { verifyToken, isAdmin } = require("../../../middleware/auth.middleware");
-const { uploadImage } = require("../../../middleware/upload");
+const { uploadReelMedia } = require("../../../middleware/upload");
 const {
   getPublicReelsHandler,
   getAdminReelsHandler,
@@ -14,6 +14,11 @@ const {
 
 const router = express.Router();
 
+const reelUpload = uploadReelMedia.fields([
+  { name: "video", maxCount: 1 },
+  { name: "thumbnail", maxCount: 1 },
+]);
+
 // Public route for customer frontend (Home + Menu page)
 router.get("/", getPublicReelsHandler);
 
@@ -21,8 +26,8 @@ router.get("/", getPublicReelsHandler);
 router.get("/admin", verifyToken, isAdmin, getAdminReelsHandler);
 router.patch("/reorder", verifyToken, isAdmin, reorderReelsHandler);
 router.get("/:id", verifyToken, isAdmin, getReelByIdHandler);
-router.post("/", verifyToken, isAdmin, uploadImage.single("thumbnail"), createReelHandler);
-router.put("/:id", verifyToken, isAdmin, uploadImage.single("thumbnail"), updateReelHandler);
+router.post("/", verifyToken, isAdmin, reelUpload, createReelHandler);
+router.put("/:id", verifyToken, isAdmin, reelUpload, updateReelHandler);
 router.patch("/:id/status", verifyToken, isAdmin, toggleReelStatusHandler);
 router.delete("/:id", verifyToken, isAdmin, deleteReelHandler);
 

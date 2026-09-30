@@ -14,6 +14,14 @@ const {
 } = require("../../services/storage/storage.service");
 
 function detectPlatform(url = "") {
+  if (!url) return "youtube";
+  if (
+    /\.(mp4|webm|mov|m4v)(\?.*)?$/i.test(url) ||
+    /cloudinary\.com.*\/video\//i.test(url) ||
+    /uploads\/reels/i.test(url)
+  ) {
+    return "direct";
+  }
   if (/instagram\.com/i.test(url)) return "instagram";
   if (/youtube\.com|youtu\.be/i.test(url)) return "youtube";
   return "youtube";
@@ -89,21 +97,41 @@ async function getReelByIdHandler(req, res) {
 // Admin: Create new reel
 async function createReelHandler(req, res) {
   try {
-    const { title, video_url, sort_order, is_active } = req.body;
+    const { title, sort_order, is_active } = req.body;
 
     if (!title || !title.trim()) {
       return res.status(400).json({ success: false, message: "Title is required" });
     }
-    if (!video_url || !video_url.trim()) {
-      return res.status(400).json({ success: false, message: "Video URL is required" });
+
+    const videoFile = req.files?.video?.[0];
+    const thumbnailFile = req.files?.thumbnail?.[0] || req.file;
+
+    let finalVideoUrl = req.body.video_url ? req.body.video_url.trim() : "";
+    let platform = req.body.platform;
+
+    if (videoFile) {
+      const uploadRes = await uploadFile(videoFile, {
+        folder: "reels/videos",
+        resourceType: "video",
+      });
+      finalVideoUrl = uploadRes.url;
+      platform = "direct";
     }
 
-    const trimmedUrl = video_url.trim();
-    const platform = req.body.platform || detectPlatform(trimmedUrl);
+    if (!finalVideoUrl) {
+      return res.status(400).json({
+        success: false,
+        message: "Please upload an MP4 video file or provide a video URL",
+      });
+    }
+
+    if (!platform) {
+      platform = detectPlatform(finalVideoUrl);
+    }
 
     let thumbnailUrl = null;
-    if (req.file) {
-      const uploadRes = await uploadFile(req.file, { folder: "reels" });
+    if (thumbnailFile) {
+      const uploadRes = await uploadFile(thumbnailFile, { folder: "reels" });
       thumbnailUrl = uploadRes.url;
     } else if (req.body.thumbnail_url && typeof req.body.thumbnail_url === "string") {
       thumbnailUrl = req.body.thumbnail_url.trim();
@@ -111,12 +139,12 @@ async function createReelHandler(req, res) {
 
     // Fallback to auto YouTube thumbnail if not provided
     if (!thumbnailUrl) {
-      thumbnailUrl = resolveThumbnail(trimmedUrl, platform, null);
+      thumbnailUrl = resolveThumbnail(finalVideoUrl, platform, null);
     }
 
     const reelData = {
       title: title.trim(),
-      video_url: trimmedUrl,
+      video_url: finalVideoUrl,
       platform,
       thumbnail_url: thumbnailUrl,
       sort_order: Number(sort_order) || 0,
@@ -146,25 +174,43 @@ async function updateReelHandler(req, res) {
       return res.status(404).json({ success: false, message: "Reel not found" });
     }
 
-    const { title, video_url, sort_order, is_active } = req.body;
-    const trimmedUrl = video_url ? video_url.trim() : existing.video_url;
-    const platform = req.body.platform || detectPlatform(trimmedUrl);
+    const { title, sort_order, is_active } = req.body;
+    const videoFile = req.files?.video?.[0];
+    const thumbnailFile = req.files?.thumbnail?.[0] || req.file;
+
+    let finalVideoUrl = existing.video_url;
+    let platform = req.body.platform;
+
+    if (videoFile) {
+      const uploadRes = await uploadFile(videoFile, {
+        folder: "reels/videos",
+        resourceType: "video",
+      });
+      finalVideoUrl = uploadRes.url;
+      platform = "direct";
+    } else if (req.body.video_url && req.body.video_url.trim()) {
+      finalVideoUrl = req.body.video_url.trim();
+    }
+
+    if (!platform) {
+      platform = detectPlatform(finalVideoUrl);
+    }
 
     let thumbnailUrl = existing.thumbnail_url;
-    if (req.file) {
-      const uploadRes = await uploadFile(req.file, { folder: "reels" });
+    if (thumbnailFile) {
+      const uploadRes = await uploadFile(thumbnailFile, { folder: "reels" });
       thumbnailUrl = uploadRes.url;
     } else if (req.body.thumbnail_url !== undefined) {
       thumbnailUrl = req.body.thumbnail_url ? req.body.thumbnail_url.trim() : null;
     }
 
     if (!thumbnailUrl) {
-      thumbnailUrl = resolveThumbnail(trimmedUrl, platform, null);
+      thumbnailUrl = resolveThumbnail(finalVideoUrl, platform, null);
     }
 
     const updateData = {
       title: title ? title.trim() : existing.title,
-      video_url: trimmedUrl,
+      video_url: finalVideoUrl,
       platform,
       thumbnail_url: thumbnailUrl,
       sort_order: sort_order !== undefined ? Number(sort_order) : existing.sort_order,

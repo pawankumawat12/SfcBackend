@@ -96,7 +96,31 @@ const uploadChatAttachment = multer({
   },
 });
 
+const uploadReelMedia = multer({
+  storage,
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (file.fieldname === "video") {
+      const allowedVideoExts = new Set([".mp4", ".webm", ".mov", ".m4v", ".mkv"]);
+      if (file.mimetype?.startsWith("video/") || allowedVideoExts.has(ext)) {
+        return cb(null, true);
+      }
+      return cb(new Error("Only video files (MP4, WEBM, MOV) are allowed."));
+    }
+    // thumbnail
+    const allowedImgExts = new Set([".jpg", ".jpeg", ".png", ".webp"]);
+    if (file.mimetype?.startsWith("image/") || allowedImgExts.has(ext)) {
+      return cb(null, true);
+    }
+    return cb(new Error("Only image files (JPG, PNG, WEBP) are allowed for thumbnails."));
+  },
+  limits: {
+    fileSize: 100 * 1024 * 1024, // 100 MB max for reel videos
+  },
+});
+
 module.exports = {
   uploadImage,
   uploadChatAttachment,
+  uploadReelMedia,
 };
