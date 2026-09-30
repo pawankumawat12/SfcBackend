@@ -20,6 +20,7 @@ const emailTemplateRoutes = require("./src/modules/emailTemplates/emailTemplate.
 const heroSliderRoutes = require("./src/modules/heroSlider/heroSlider.routes");
 const whyChooseUsRoutes = require("./src/modules/whyChooseUs/whyChooseUs.routes");
 const testimonialRoutes = require("./src/modules/testimonials/testimonial.routes");
+const reelsRoutes = require("./src/modules/reels/reels.routes");
 const webhookRoutes = require("./src/modules/webhook/webhook.routes");
 const cmsRoutes = require("./src/modules/cmsPage/cmsPage.routes");
 const inventoryRoutes = require("./src/modules/inventory/inventory.routes");
@@ -135,6 +136,7 @@ v1Router.use("/email-templates", emailTemplateRoutes);
 v1Router.use("/hero-sliders", heroSliderRoutes);
 v1Router.use("/why-choose-us", whyChooseUsRoutes);
 v1Router.use("/testimonials", testimonialRoutes);
+v1Router.use("/reels", reelsRoutes);
 v1Router.use("/cms", cmsRoutes);
 v1Router.use("/inventory", inventoryRoutes);
 v1Router.use("/stores", storeRoutes);
