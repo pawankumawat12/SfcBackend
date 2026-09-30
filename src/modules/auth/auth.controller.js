@@ -615,7 +615,7 @@ const verifyOtp = async (req, res) => {
     if (isStorefrontClient && user.role === "admin") {
       return res.status(403).json({
         success: false,
-        message: "Admin accounts cannot log in to the customer storefront. Please use the Admin Panel.",
+        message: "Invalid Credentials",
       });
     }
 
@@ -1288,7 +1288,7 @@ async function googleAuth(req, res) {
       if (user.role === "admin") {
         return res.status(403).json({
           success: false,
-          message: "Admin accounts cannot log in to the customer storefront. Please use the Admin Panel.",
+          message: "Invalid Credentials.",
         });
       }
 
