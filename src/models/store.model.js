@@ -93,6 +93,31 @@ async function ensureStoreColumns() {
       ALTER TABLE order_items ADD COLUMN IF NOT EXISTS store_id INTEGER;
       ALTER TABLE stores ADD COLUMN IF NOT EXISTS max_delivery_distance NUMERIC(5, 2) DEFAULT 10.0;
       ALTER TABLE stores ADD COLUMN IF NOT EXISTS is_main_admin BOOLEAN DEFAULT FALSE;
+
+      CREATE TABLE IF NOT EXISTS store_payouts (
+        id SERIAL PRIMARY KEY,
+        payout_number VARCHAR(100) UNIQUE NOT NULL,
+        store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        period_start TIMESTAMPTZ,
+        period_end TIMESTAMPTZ,
+        orders_count INTEGER DEFAULT 0,
+        orders_ids_json JSONB DEFAULT '[]'::jsonb,
+        online_share NUMERIC(12, 2) DEFAULT 0,
+        cod_commission_deducted NUMERIC(12, 2) DEFAULT 0,
+        payment_mode VARCHAR(50) DEFAULT 'Bank Transfer',
+        payment_reference VARCHAR(150),
+        notes TEXT,
+        settled_by INTEGER,
+        settled_by_name VARCHAR(150),
+        status VARCHAR(50) DEFAULT 'completed',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_settled_to_store BOOLEAN DEFAULT FALSE;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_payout_id INTEGER;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ;
     `);
 
     columnsChecked = true;
@@ -864,9 +889,10 @@ async function checkTerritoryConflict(lat, lng, excludeStoreId = null) {
  * If outside all branches, Admin can deliver everywhere!
  */
 async function resolveStoreByCustomerLocation(custLat, custLng) {
-  await ensureStoreColumns();
-  const numLat = Number(custLat);
-  const numLng = Number(custLng);
+  try {
+    await ensureStoreColumns();
+    const numLat = Number(custLat);
+    const numLng = Number(custLng);
 
   // 1. Get Admin store details from order_pricing settings
   let adminStore = {
@@ -947,20 +973,222 @@ async function resolveStoreByCustomerLocation(custLat, custLng) {
   const adminMaxDist = adminStore.max_delivery_distance;
   const canAdminDeliver = adminMaxDist == null || distToAdmin == null || distToAdmin <= adminMaxDist;
 
-  return {
-    store: {
-      ...adminStore,
+    return {
+      store: {
+        ...adminStore,
+        distanceKm: distToAdmin,
+        can_deliver: canAdminDeliver,
+      },
+      storeType: "admin",
       distanceKm: distToAdmin,
       can_deliver: canAdminDeliver,
+      outOfDeliveryZone: !canAdminDeliver,
+      message: canAdminDeliver
+        ? `Fulfilled by Main Bakery (${distToAdmin} km away)`
+        : `Location is ${distToAdmin} km away (outside our maximum delivery radius of ${adminMaxDist} km).`,
+    };
+  } catch (err) {
+    console.error("resolveStoreByCustomerLocation error:", err);
+    return null;
+  }
+}
+
+async function getStoreSettlementSummary(storeId) {
+  await ensureStoreColumns();
+  const sId = Number(storeId);
+  const store = await db("stores").where({ id: sId }).first();
+  if (!store) {
+    throw new Error("Store not found");
+  }
+
+  // 1. Lifetime Delivered Orders Metrics
+  const lifetimeDeliveredOrders = await db("orders")
+    .where({ store_id: sId, is_forwarded_to_store: true })
+    .whereIn(db.raw("LOWER(status)"), ["delivered", "completed"])
+    .select([
+      db.raw("COUNT(id)::int as total_orders"),
+      db.raw("COALESCE(SUM(total_amount), 0)::float as total_sales"),
+      db.raw(`
+        COALESCE(SUM(
+          COALESCE(
+            store_payable_amount,
+            store_gross_amount,
+            (COALESCE(subtotal, 0) + COALESCE(delivery_fee, 0) + COALESCE(packaging_fee, 0)) - COALESCE(admin_commission_amount, 0)
+          )
+        ), 0)::float as total_store_earnings
+      `),
+      db.raw("COALESCE(SUM(admin_commission_amount), 0)::float as total_admin_commission"),
+    ])
+    .first();
+
+  // 2. Already Settled Amount from store_payouts table
+  const pastPayoutsSum = await db("store_payouts")
+    .where({ store_id: sId, status: "completed" })
+    .select([
+      db.raw("COALESCE(SUM(amount), 0)::float as total_paid"),
+      db.raw("COUNT(id)::int as total_payouts_count"),
+    ])
+    .first();
+
+  const lastPayout = await db("store_payouts")
+    .where({ store_id: sId, status: "completed" })
+    .orderBy("created_at", "desc")
+    .first();
+
+  // 3. Current Unsettled Orders (Pending this cycle)
+  const unsettledOrders = await db("orders")
+    .where({ store_id: sId, is_forwarded_to_store: true })
+    .whereIn(db.raw("LOWER(status)"), ["delivered", "completed"])
+    .where(function () {
+      this.where("is_settled_to_store", false).orWhereNull("is_settled_to_store");
+    })
+    .select([
+      "id",
+      "order_number",
+      "payment_method",
+      "total_amount",
+      "subtotal",
+      "delivery_fee",
+      "packaging_fee",
+      "admin_commission_amount",
+      "store_payable_amount",
+      "created_at",
+    ]);
+
+  let unsettledOnlinePayable = 0;
+  let unsettledCodCommission = 0;
+  let unsettledGrossSales = 0;
+  let unsettledAdminCommission = 0;
+  const unsettledOrderIds = [];
+
+  for (const o of unsettledOrders) {
+    unsettledOrderIds.push(o.id);
+    const orderTotal = Number(o.total_amount || 0);
+    const comm = Number(o.admin_commission_amount || 0);
+    const storePayable = o.store_payable_amount !== undefined && o.store_payable_amount !== null
+      ? Number(o.store_payable_amount)
+      : Math.max(0, (Number(o.subtotal || 0) + Number(o.delivery_fee || 0) + Number(o.packaging_fee || 0)) - comm);
+
+    unsettledGrossSales += orderTotal;
+    unsettledAdminCommission += comm;
+
+    const pm = String(o.payment_method || "").toLowerCase();
+    const isCod = pm.includes("cash") || pm.includes("cod");
+    if (isCod) {
+      unsettledCodCommission += comm;
+    } else {
+      unsettledOnlinePayable += storePayable;
+    }
+  }
+
+  // Net Pending Payout = Online Store Share - COD Admin Commission
+  const currentPendingPayout = Math.round((unsettledOnlinePayable - unsettledCodCommission) * 100) / 100;
+
+  return {
+    store_id: sId,
+    store_name: store.name,
+    lifetime: {
+      total_delivered_orders: lifetimeDeliveredOrders?.total_orders || 0,
+      total_gross_sales: lifetimeDeliveredOrders?.total_sales || 0,
+      total_store_earnings: lifetimeDeliveredOrders?.total_store_earnings || 0,
+      total_admin_commission: lifetimeDeliveredOrders?.total_admin_commission || 0,
     },
-    storeType: "admin",
-    distanceKm: distToAdmin,
-    can_deliver: canAdminDeliver,
-    outOfDeliveryZone: !canAdminDeliver,
-    message: canAdminDeliver
-      ? `Fulfilled by Main Bakery (${distToAdmin} km away)`
-      : `Location is ${distToAdmin} km away (outside our maximum delivery radius of ${adminMaxDist} km).`,
+    settlement: {
+      total_already_paid: pastPayoutsSum?.total_paid || 0,
+      total_payouts_count: pastPayoutsSum?.total_payouts_count || 0,
+      last_payout: lastPayout || null,
+      current_pending_payout: currentPendingPayout,
+      unsettled_orders_count: unsettledOrders.length,
+      unsettled_gross_sales: Math.round(unsettledGrossSales * 100) / 100,
+      unsettled_online_payable: Math.round(unsettledOnlinePayable * 100) / 100,
+      unsettled_cod_commission: Math.round(unsettledCodCommission * 100) / 100,
+      unsettled_order_ids: unsettledOrderIds,
+    },
   };
+}
+
+async function createStorePayout({
+  storeId,
+  amount,
+  paymentMode = "Bank Transfer",
+  paymentReference = "",
+  notes = "",
+  settledBy = null,
+  settledByName = "Admin",
+  periodStart = null,
+  periodEnd = null,
+  orderIds = null,
+}) {
+  await ensureStoreColumns();
+  const sId = Number(storeId);
+  const store = await db("stores").where({ id: sId }).first();
+  if (!store) {
+    throw new Error("Store not found");
+  }
+
+  return await db.transaction(async (trx) => {
+    // 1. Identify orders to settle
+    let targetOrderIds = Array.isArray(orderIds) && orderIds.length > 0 ? orderIds : [];
+    if (targetOrderIds.length === 0) {
+      let ordersQuery = trx("orders")
+        .where({ store_id: sId, is_forwarded_to_store: true })
+        .whereIn(trx.raw("LOWER(status)"), ["delivered", "completed"])
+        .where(function () {
+          this.where("is_settled_to_store", false).orWhereNull("is_settled_to_store");
+        });
+
+      if (periodEnd) {
+        ordersQuery = ordersQuery.where("created_at", "<=", periodEnd);
+      }
+      const fetched = await ordersQuery.select("id");
+      targetOrderIds = fetched.map((o) => o.id);
+    }
+
+    const payoutNumber = `PAYOUT-${sId}-${Date.now().toString().slice(-6)}-${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
+    const payoutAmount = Number(amount) || 0;
+
+    const [payout] = await trx("store_payouts")
+      .insert({
+        payout_number: payoutNumber,
+        store_id: sId,
+        amount: payoutAmount,
+        period_start: periodStart || null,
+        period_end: periodEnd || new Date(),
+        orders_count: targetOrderIds.length,
+        orders_ids_json: JSON.stringify(targetOrderIds),
+        payment_mode: paymentMode,
+        payment_reference: paymentReference,
+        notes: notes,
+        settled_by: settledBy,
+        settled_by_name: settledByName,
+        status: "completed",
+        created_at: new Date(),
+        updated_at: new Date(),
+      })
+      .returning("*");
+
+    // 2. Mark the orders as settled
+    if (targetOrderIds.length > 0) {
+      await trx("orders")
+        .whereIn("id", targetOrderIds)
+        .update({
+          is_settled_to_store: true,
+          store_payout_id: payout.id,
+          settled_at: new Date(),
+          updated_at: new Date(),
+        });
+    }
+
+    return payout;
+  });
+}
+
+async function listStorePayouts(storeId) {
+  await ensureStoreColumns();
+  const sId = Number(storeId);
+  return db("store_payouts")
+    .where({ store_id: sId })
+    .orderBy("created_at", "desc");
 }
 
 module.exports = {
@@ -983,5 +1211,8 @@ module.exports = {
   calculateDistanceInKm,
   checkTerritoryConflict,
   resolveStoreByCustomerLocation,
+  getStoreSettlementSummary,
+  createStorePayout,
+  listStorePayouts,
 };
 

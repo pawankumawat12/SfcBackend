@@ -17,6 +17,9 @@ const {
   getMyStore,
   updateMyStoreLocation,
   resolveStoreByLocation,
+  getStoreSettlementSummaryController,
+  createStorePayoutController,
+  listStorePayoutsController,
 } = require("./store.controller");
 const { verifyToken, isAdmin } = require("../../../middleware/auth.middleware");
 
@@ -42,6 +45,11 @@ router.get("/:id", verifyToken, getStoreDetails);
 router.patch("/:id", verifyToken, isAdmin, updateStore);
 router.patch("/:id/auto-forward", verifyToken, isAdmin, toggleStoreAutoForward);
 router.delete("/:id", verifyToken, isAdmin, deleteStore);
+
+// Settlement & Payout routes
+router.get("/:id/settlement-summary", verifyToken, getStoreSettlementSummaryController);
+router.get("/:id/payouts", verifyToken, listStorePayoutsController);
+router.post("/:id/payouts", verifyToken, isAdmin, createStorePayoutController);
 
 module.exports = router;
 

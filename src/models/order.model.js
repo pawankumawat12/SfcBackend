@@ -716,7 +716,7 @@ async function findOrderById(orderId, userId = null) {
   };
 }
 
-async function findAllOrders({ page = 1, limit = 20, status, search, storeId, isForwardedOnly = false }) {
+async function findAllOrders({ page = 1, limit = 20, status, search, storeId, isForwardedOnly = false, startDate, endDate }) {
   await ensureOrderStoreColumns();
   const p = Math.max(1, Number(page) || 1);
   const l = Math.max(1, Math.min(100, Number(limit) || 20));
@@ -779,6 +779,16 @@ async function findAllOrders({ page = 1, limit = 20, status, search, storeId, is
         .orWhereILike("o.customer_phone", s)
         .orWhereILike("s.name", s);
     });
+  }
+
+  if (startDate) {
+    query = query.where("o.created_at", ">=", startDate);
+    baseStatsQuery = baseStatsQuery.where("o.created_at", ">=", startDate);
+  }
+
+  if (endDate) {
+    query = query.where("o.created_at", "<=", endDate);
+    baseStatsQuery = baseStatsQuery.where("o.created_at", "<=", endDate);
   }
 
   const [orders, countRow, statsRow] = await Promise.all([

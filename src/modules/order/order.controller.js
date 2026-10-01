@@ -741,7 +741,7 @@ async function getOrderDetails(req, res) {
 
 async function getAdminOrders(req, res) {
   try {
-    const { page, limit, status, search, store_id, storeId } = req.query;
+    const { page, limit, status, search, store_id, storeId, startDate, endDate } = req.query;
     const rawStoreId = store_id || storeId;
     let targetStoreId = rawStoreId ? Number(rawStoreId) : undefined;
     let isForwardedOnly = false;
@@ -775,6 +775,8 @@ async function getAdminOrders(req, res) {
       search,
       storeId: targetStoreId,
       isForwardedOnly,
+      startDate,
+      endDate,
     });
 
     return res.status(200).json({

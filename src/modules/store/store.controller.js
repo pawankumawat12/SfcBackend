@@ -841,6 +841,99 @@ async function resolveStoreByLocation(req, res) {
   }
 }
 
+async function getStoreSettlementSummaryController(req, res) {
+  try {
+    const storeId = Number(req.params.storeId || req.params.id);
+    if (!storeId) {
+      return res.status(400).json({ success: false, message: "Valid store ID is required" });
+    }
+
+    if (req.user.role === "store_owner") {
+      let userStore = await storeModel.getStoreByOwnerId(req.user.id);
+      if (!userStore && req.user.store_id) {
+        userStore = await storeModel.getStoreById(req.user.store_id);
+      }
+      if (!userStore || Number(userStore.id) !== storeId) {
+        return res.status(403).json({ success: false, message: "Access denied" });
+      }
+    }
+
+    const summary = await storeModel.getStoreSettlementSummary(storeId);
+    return res.status(200).json({
+      success: true,
+      data: summary,
+    });
+  } catch (error) {
+    console.error("Get store settlement summary error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to fetch settlement summary." });
+  }
+}
+
+async function createStorePayoutController(req, res) {
+  try {
+    const storeId = Number(req.params.storeId || req.params.id);
+    if (!storeId) {
+      return res.status(400).json({ success: false, message: "Valid store ID is required" });
+    }
+
+    if (req.user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only administrators can record store payouts." });
+    }
+
+    const { amount, paymentMode, paymentReference, notes, periodStart, periodEnd, orderIds } = req.body || {};
+
+    const payout = await storeModel.createStorePayout({
+      storeId,
+      amount: Number(amount) || 0,
+      paymentMode: paymentMode || "Bank Transfer",
+      paymentReference: paymentReference || "",
+      notes: notes || "",
+      settledBy: req.user.id,
+      settledByName: req.user.name || "Admin",
+      periodStart,
+      periodEnd,
+      orderIds,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Store payout successfully recorded and orders settled!",
+      data: payout,
+    });
+  } catch (error) {
+    console.error("Create store payout error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to record store payout." });
+  }
+}
+
+async function listStorePayoutsController(req, res) {
+  try {
+    const storeId = Number(req.params.storeId || req.params.id);
+    if (!storeId) {
+      return res.status(400).json({ success: false, message: "Valid store ID is required" });
+    }
+
+    if (req.user.role === "store_owner") {
+      let userStore = await storeModel.getStoreByOwnerId(req.user.id);
+      if (!userStore && req.user.store_id) {
+        userStore = await storeModel.getStoreById(req.user.store_id);
+      }
+      if (!userStore || Number(userStore.id) !== storeId) {
+        return res.status(403).json({ success: false, message: "Access denied" });
+      }
+    }
+
+    const payouts = await storeModel.listStorePayouts(storeId);
+    return res.status(200).json({
+      success: true,
+      data: payouts,
+    });
+  } catch (error) {
+    console.error("List store payouts error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to list store payouts." });
+  }
+}
+
 module.exports = {
   createStore,
   listStores,
@@ -858,4 +951,7 @@ module.exports = {
   getMyStore,
   updateMyStoreLocation,
   resolveStoreByLocation,
+  getStoreSettlementSummaryController,
+  createStorePayoutController,
+  listStorePayoutsController,
 };
