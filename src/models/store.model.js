@@ -259,7 +259,7 @@ async function listStores({ search = "", is_open, is_active, page = 1, limit = 5
           SELECT COUNT(id)::int 
           FROM orders 
           WHERE store_id = s.id
-            AND NOT (COALESCE(is_forwarded_to_store, false) = false AND LOWER(COALESCE(status, '')) IN ('delivered', 'completed'))
+            AND COALESCE(is_forwarded_to_store, false) = true
             AND LOWER(COALESCE(status, '')) NOT IN ('cancelled', 'rejected', 'payment failed')
         ), 0) as total_orders
       `),
@@ -268,7 +268,7 @@ async function listStores({ search = "", is_open, is_active, page = 1, limit = 5
           SELECT SUM(total_amount)::float 
           FROM orders 
           WHERE store_id = s.id 
-            AND NOT (COALESCE(is_forwarded_to_store, false) = false AND LOWER(COALESCE(status, '')) IN ('delivered', 'completed'))
+            AND COALESCE(is_forwarded_to_store, false) = true
             AND LOWER(COALESCE(status, '')) NOT IN ('cancelled', 'rejected', 'payment failed')
             AND LOWER(COALESCE(payment_status, '')) NOT IN ('failed', 'refunded')
         ), 0) as total_revenue
@@ -362,7 +362,7 @@ async function getStoreById(id) {
           SELECT COUNT(id)::int 
           FROM orders 
           WHERE store_id = s.id
-            AND NOT (COALESCE(is_forwarded_to_store, false) = false AND LOWER(COALESCE(status, '')) IN ('delivered', 'completed'))
+            AND COALESCE(is_forwarded_to_store, false) = true
             AND LOWER(COALESCE(status, '')) NOT IN ('cancelled', 'rejected', 'payment failed')
         ), 0) as total_orders
       `),
@@ -371,7 +371,7 @@ async function getStoreById(id) {
           SELECT SUM(total_amount)::float 
           FROM orders 
           WHERE store_id = s.id 
-            AND NOT (COALESCE(is_forwarded_to_store, false) = false AND LOWER(COALESCE(status, '')) IN ('delivered', 'completed'))
+            AND COALESCE(is_forwarded_to_store, false) = true
             AND LOWER(COALESCE(status, '')) NOT IN ('cancelled', 'rejected', 'payment failed')
             AND LOWER(COALESCE(payment_status, '')) NOT IN ('failed', 'refunded')
         ), 0) as total_revenue

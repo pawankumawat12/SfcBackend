@@ -16,6 +16,11 @@ async function ensureOrderStoreColumns() {
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_forwarded_to_store BOOLEAN DEFAULT FALSE;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS forwarded_at TIMESTAMPTZ;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_stock_reverted BOOLEAN DEFAULT FALSE;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_gross_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_commission_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_payable_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS developer_commission_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_net_commission_amount NUMERIC DEFAULT 0;
       ALTER TABLE order_items ADD COLUMN IF NOT EXISTS store_id INTEGER;
     `);
     orderStoreColumnsChecked = true;
@@ -189,6 +194,15 @@ async function createOrderWithTransaction({
         packaging_fee: roundCurrency(pricing.packaging_fee),
         platform_fee: roundCurrency(pricing.platform_fee),
         cod_fee: roundCurrency(pricing.cod_fee),
+
+        // Store Settlement & Commission snapshot (only for branch stores, 0 for Main Bakery)
+        store_gross_amount: orderStoreId ? roundCurrency(pricing.store_gross_amount || 0) : 0,
+        admin_commission_amount: orderStoreId ? roundCurrency(pricing.admin_commission_amount || 0) : 0,
+        store_payable_amount: orderStoreId ? roundCurrency(pricing.store_payable_amount || 0) : 0,
+
+        // Developer Royalty & Tech Earnings snapshot (Admin Only)
+        developer_commission_amount: roundCurrency(pricing.developer_total_earnings || 0),
+        admin_net_commission_amount: roundCurrency(pricing.admin_net_commission || 0),
 
         distance_km: pricing.distance_km || 0,
 
@@ -504,8 +518,75 @@ function formatOrderRow(order) {
   }
   const chatStatus = getOrderChatStatus(order);
 
+  // Store settlement calculation with fallback for branch store orders (Main Bakery has 0 commission)
+  const isBranchOrder = Boolean(order.store_id) && order.store_name !== "Main Bakery";
+  const subtotal = Number(order.subtotal || 0);
+  const deliveryFee = Number(order.delivery_fee || 0);
+  const packagingFee = Number(order.packaging_fee || 0);
+  const fallbackGross = Math.round(subtotal + deliveryFee + packagingFee);
+
+  const storeGross = isBranchOrder
+    ? Number(
+        order.store_gross_amount != null && Number(order.store_gross_amount) > 0
+          ? order.store_gross_amount
+          : pricingDetailsJson?.store_gross_amount != null
+          ? pricingDetailsJson.store_gross_amount
+          : fallbackGross
+      )
+    : 0;
+
+  const adminCommission = isBranchOrder
+    ? Number(
+        order.admin_commission_amount != null
+          ? order.admin_commission_amount
+          : pricingDetailsJson?.admin_commission_amount != null
+          ? pricingDetailsJson.admin_commission_amount
+          : 0
+      )
+    : 0;
+
+  const storePayable = isBranchOrder
+    ? Number(
+        order.store_payable_amount != null && Number(order.store_payable_amount) > 0
+          ? order.store_payable_amount
+          : pricingDetailsJson?.store_payable_amount != null
+          ? pricingDetailsJson.store_payable_amount
+          : Math.max(0, storeGross - adminCommission)
+      )
+    : 0;
+
+  // Developer Royalty & Tech Earnings (Admin Only)
+  const platformFee = Number(order.platform_fee != null ? order.platform_fee : (pricingDetailsJson?.platform_fee || 0));
+  const developerCommissionShare = Number(
+    pricingDetailsJson?.developer_commission_share != null
+      ? pricingDetailsJson.developer_commission_share
+      : (isBranchOrder ? Math.round(adminCommission * 0.25) : 0)
+  );
+  const developerTotalEarnings = Number(
+    order.developer_commission_amount != null && Number(order.developer_commission_amount) > 0
+      ? order.developer_commission_amount
+      : (pricingDetailsJson?.developer_total_earnings != null
+          ? pricingDetailsJson.developer_total_earnings
+          : Math.round(platformFee + developerCommissionShare))
+  );
+  const adminNetCommission = Number(
+    order.admin_net_commission_amount != null
+      ? order.admin_net_commission_amount
+      : (pricingDetailsJson?.admin_net_commission != null
+          ? pricingDetailsJson.admin_net_commission
+          : Math.max(0, adminCommission - developerCommissionShare))
+  );
+
   return {
     ...order,
+    store_gross_amount: storeGross,
+    admin_commission_amount: adminCommission,
+    store_payable_amount: storePayable,
+    developer_platform_fee: platformFee,
+    developer_commission_share: developerCommissionShare,
+    developer_total_earnings: developerTotalEarnings,
+    developer_total_fee: developerTotalEarnings,
+    admin_net_commission: adminNetCommission,
     delivery_address_json: deliveryAddressJson,
     pricing_details_json: pricingDetailsJson,
     payment_details_json: paymentDetailsJson,
@@ -716,6 +797,132 @@ async function findAllOrders({ page = 1, limit = 20, status, search, storeId, is
             END
           ), 0)::float as total_amount
         `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+              THEN COALESCE(o.admin_commission_amount, 0)
+              ELSE 0
+            END
+          ), 0)::float as total_commission
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+              THEN COALESCE(
+                o.store_payable_amount,
+                o.store_gross_amount,
+                (COALESCE(o.subtotal, 0) + COALESCE(o.delivery_fee, 0) + COALESCE(o.packaging_fee, 0))
+              )
+              ELSE 0
+            END
+          ), 0)::float as total_store_payable
+        `),
+        db.raw(`
+          COUNT(CASE 
+            WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                 AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                 AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+            THEN 1 
+          END)::int as online_orders_count
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN o.total_amount
+              ELSE 0
+            END
+          ), 0)::float as online_total_amount
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(o.admin_commission_amount, 0)
+              ELSE 0
+            END
+          ), 0)::float as online_commission
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(
+                o.store_payable_amount,
+                o.store_gross_amount,
+                (COALESCE(o.subtotal, 0) + COALESCE(o.delivery_fee, 0) + COALESCE(o.packaging_fee, 0))
+              )
+              ELSE 0
+            END
+          ), 0)::float as online_store_payable
+        `),
+        db.raw(`
+          COUNT(CASE 
+            WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                 AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                 AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+            THEN 1 
+          END)::int as cod_orders_count
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN o.total_amount
+              ELSE 0
+            END
+          ), 0)::float as cod_total_amount
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(o.admin_commission_amount, 0)
+              ELSE 0
+            END
+          ), 0)::float as cod_commission
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(
+                o.store_payable_amount,
+                o.store_gross_amount,
+                (COALESCE(o.subtotal, 0) + COALESCE(o.delivery_fee, 0) + COALESCE(o.packaging_fee, 0))
+              )
+              ELSE 0
+            END
+          ), 0)::float as cod_store_payable
+        `),
         db.raw("COUNT(CASE WHEN LOWER(o.status) = 'preparing' THEN 1 END)::int as preparing_orders"),
         db.raw("COUNT(CASE WHEN LOWER(o.status) IN ('out for delivery', 'out_for_delivery') THEN 1 END)::int as out_for_delivery_orders"),
         db.raw("COUNT(CASE WHEN LOWER(o.status) = 'delivered' THEN 1 END)::int as delivered_orders"),
@@ -727,9 +934,24 @@ async function findAllOrders({ page = 1, limit = 20, status, search, storeId, is
   ]);
 
   const total = Number(countRow?.count || 0);
+  const onlineStorePayable = Math.round(Number(statsRow?.online_store_payable || 0));
+  const codCommission = Math.round(Number(statsRow?.cod_commission || 0));
+  const netStorePayout = onlineStorePayable - codCommission;
+
   const stats = {
     totalOrders: Number(statsRow?.total_orders || total),
     totalAmount: Math.round(Number(statsRow?.total_amount || 0)),
+    totalCommission: Math.round(Number(statsRow?.total_commission || 0)),
+    totalStorePayable: Math.round(Number(statsRow?.total_store_payable || 0)),
+    onlineOrdersCount: Number(statsRow?.online_orders_count || 0),
+    onlineTotalAmount: Math.round(Number(statsRow?.online_total_amount || 0)),
+    onlineCommission: Math.round(Number(statsRow?.online_commission || 0)),
+    onlineStorePayable,
+    codOrdersCount: Number(statsRow?.cod_orders_count || 0),
+    codTotalAmount: Math.round(Number(statsRow?.cod_total_amount || 0)),
+    codCommission,
+    codStorePayable: Math.round(Number(statsRow?.cod_store_payable || 0)),
+    netStorePayout,
     preparingOrders: Number(statsRow?.preparing_orders || 0),
     outForDeliveryOrders: Number(statsRow?.out_for_delivery_orders || 0),
     deliveredOrders: Number(statsRow?.delivered_orders || 0),
@@ -903,6 +1125,14 @@ async function updateOrderStatus(orderId, status) {
           );
         }
       }
+
+      // Direct Admin Delivery: Store was not involved, so branch payable and admin commission are 0.
+      // Developer receives 100% of the platform fee only (no commission cut).
+      updatePayload.store_payable_amount = 0;
+      updatePayload.store_gross_amount = 0;
+      updatePayload.admin_commission_amount = 0;
+      updatePayload.admin_net_commission_amount = 0;
+      updatePayload.developer_commission_amount = Number(order.platform_fee || 0);
 
       updatePayload.store_stock_reverted = true;
     }

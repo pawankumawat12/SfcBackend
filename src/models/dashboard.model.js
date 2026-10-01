@@ -71,6 +71,12 @@ const DashboardModel = {
       cancelledOrdersRow,
       totalCustomersRow,
       totalProductsRow,
+      storeEarningsRow,
+      mainBakeryStatsRow,
+      mainBakeryTodayRow,
+      branchStoresStatsRow,
+      branchStoresTodayRow,
+      developerStatsRow,
     ] = await Promise.all([
       // Total orders
       baseOrders().count("id as count").first(),
@@ -122,6 +128,155 @@ const DashboardModel = {
       storeId
         ? db("products").where("store_id", storeId).where("is_active", true).count("id as count").first()
         : db("products").where("is_active", true).count("id as count").first(),
+
+      // Store settlement & earnings (only when storeId is present)
+      storeId
+        ? applyRevenueOrderFilter(baseOrders())
+            .select(
+              db.raw(`
+                COALESCE(SUM(
+                  COALESCE(
+                    NULLIF(orders.store_payable_amount, 0),
+                    NULLIF(orders.store_gross_amount, 0),
+                    (COALESCE(orders.subtotal, 0) + COALESCE(orders.delivery_fee, 0) + COALESCE(orders.packaging_fee, 0))
+                  )
+                ), 0)::float as store_net_payable
+              `),
+              db.raw(`COALESCE(SUM(COALESCE(orders.admin_commission_amount, 0)), 0)::float as store_commission`),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN NOT (LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%')
+                    THEN COALESCE(
+                      NULLIF(orders.store_payable_amount, 0),
+                      NULLIF(orders.store_gross_amount, 0),
+                      (COALESCE(orders.subtotal, 0) + COALESCE(orders.delivery_fee, 0) + COALESCE(orders.packaging_fee, 0))
+                    )
+                    ELSE 0
+                  END
+                ), 0)::float as online_store_payable
+              `),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%'
+                    THEN orders.total_amount
+                    ELSE 0
+                  END
+                ), 0)::float as cod_total_amount
+              `),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%'
+                    THEN COALESCE(orders.admin_commission_amount, 0)
+                    ELSE 0
+                  END
+                ), 0)::float as cod_commission
+              `),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN orders.created_at >= '${todayStart.toISOString()}'
+                    THEN COALESCE(
+                      NULLIF(orders.store_payable_amount, 0),
+                      NULLIF(orders.store_gross_amount, 0),
+                      (COALESCE(orders.subtotal, 0) + COALESCE(orders.delivery_fee, 0) + COALESCE(orders.packaging_fee, 0))
+                    )
+                    ELSE 0
+                  END
+                ), 0)::float as today_store_net_payable
+              `)
+            )
+            .first()
+        : Promise.resolve(null),
+
+      // Main Bakery direct realized stats (only for Admin when !storeId)
+      // Orders without store_id OR orders not forwarded to store (fulfilled/delivered directly by Admin)
+      !storeId
+        ? applyRevenueOrderFilter(
+            db("orders").where(function () {
+              this.whereNull("store_id").orWhere("is_forwarded_to_store", false);
+            })
+          )
+            .select(
+              db.raw("COUNT(id) as main_bakery_orders"),
+              db.raw("COALESCE(SUM(total_amount), 0)::float as main_bakery_revenue")
+            )
+            .first()
+        : Promise.resolve(null),
+
+      // Main Bakery Today stats (only for Admin when !storeId)
+      !storeId
+        ? db("orders")
+            .where(function () {
+              this.whereNull("store_id").orWhere("is_forwarded_to_store", false);
+            })
+            .where("created_at", ">=", todayStart)
+            .whereRaw("LOWER(status) != 'cancelled'")
+            .select(
+              db.raw("COUNT(id) as today_orders"),
+              db.raw(`${getRevenueSumExpression("orders", "total_amount")} as today_sales`)
+            )
+            .first()
+        : Promise.resolve(null),
+
+      // Branch Stores realized stats & Admin commission (only for Admin when !storeId)
+      // Only orders that were actively dispatched/forwarded to a branch store
+      !storeId
+        ? applyRevenueOrderFilter(
+            db("orders")
+              .whereNotNull("store_id")
+              .where("is_forwarded_to_store", true)
+          )
+            .select(
+              db.raw("COUNT(id) as branch_orders"),
+              db.raw("COALESCE(SUM(total_amount), 0)::float as branch_revenue"),
+              db.raw("COALESCE(SUM(COALESCE(admin_commission_amount, 0)), 0)::float as total_admin_commission"),
+              db.raw(`
+                COALESCE(SUM(
+                  COALESCE(
+                    store_payable_amount,
+                    store_gross_amount,
+                    (COALESCE(subtotal, 0) + COALESCE(delivery_fee, 0) + COALESCE(packaging_fee, 0))
+                  )
+                ), 0)::float as total_store_payable
+              `)
+            )
+            .first()
+        : Promise.resolve(null),
+
+      // Branch Stores Today stats (only for Admin when !storeId)
+      !storeId
+        ? db("orders")
+            .whereNotNull("store_id")
+            .where("is_forwarded_to_store", true)
+            .where("created_at", ">=", todayStart)
+            .whereRaw("LOWER(status) != 'cancelled'")
+            .select(
+              db.raw("COUNT(id) as today_orders"),
+              db.raw(`${getRevenueSumExpression("orders", "total_amount")} as today_sales`)
+            )
+            .first()
+        : Promise.resolve(null),
+
+      // Developer Tech Royalty stats (Platform fee 100% + commission cut) - ONLY for Admin when !storeId
+      !storeId
+        ? applyRevenueOrderFilter(db("orders"))
+            .select(
+              db.raw("COALESCE(SUM(platform_fee), 0)::float as total_platform_fee"),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN orders.created_at >= '${todayStart.toISOString()}'
+                    THEN COALESCE(platform_fee, 0)
+                    ELSE 0
+                  END
+                ), 0)::float as today_platform_fee
+              `)
+            )
+            .first()
+        : Promise.resolve(null),
     ]);
 
     const totalRevenue = Number(totalRevenueRow?.revenue || 0);
@@ -134,6 +289,31 @@ const DashboardModel = {
     const cancelledOrders = Number(cancelledOrdersRow?.count || 0);
     const totalCustomers = Number(totalCustomersRow?.count || 0);
     const totalProducts = Number(totalProductsRow?.count || 0);
+
+    const storeNetPayable = storeEarningsRow ? Math.round(Number(storeEarningsRow.store_net_payable || 0)) : 0;
+    const storeCommission = storeEarningsRow ? Math.round(Number(storeEarningsRow.store_commission || 0)) : 0;
+    const onlineStorePayable = storeEarningsRow ? Math.round(Number(storeEarningsRow.online_store_payable || 0)) : 0;
+    const codTotalAmount = storeEarningsRow ? Math.round(Number(storeEarningsRow.cod_total_amount || 0)) : 0;
+    const codCommission = storeEarningsRow ? Math.round(Number(storeEarningsRow.cod_commission || 0)) : 0;
+    const netStorePayout = onlineStorePayable - codCommission;
+    const todayStoreEarnings = storeEarningsRow ? Math.round(Number(storeEarningsRow.today_store_net_payable || 0)) : 0;
+
+    const mainBakeryRevenue = mainBakeryStatsRow ? Math.round(Number(mainBakeryStatsRow.main_bakery_revenue || 0)) : 0;
+    const mainBakeryOrders = mainBakeryStatsRow ? Number(mainBakeryStatsRow.main_bakery_orders || 0) : 0;
+    const mainBakeryTodaySales = mainBakeryTodayRow ? Math.round(Number(mainBakeryTodayRow.today_sales || 0)) : 0;
+
+    const branchStoresRevenue = branchStoresStatsRow ? Math.round(Number(branchStoresStatsRow.branch_revenue || 0)) : 0;
+    const branchStoresOrders = branchStoresStatsRow ? Number(branchStoresStatsRow.branch_orders || 0) : 0;
+    const branchStoresTodaySales = branchStoresTodayRow ? Math.round(Number(branchStoresTodayRow.today_sales || 0)) : 0;
+    const totalAdminCommission = branchStoresStatsRow ? Math.round(Number(branchStoresStatsRow.total_admin_commission || 0)) : 0;
+    const totalStorePayable = branchStoresStatsRow ? Math.round(Number(branchStoresStatsRow.total_store_payable || 0)) : 0;
+
+    // Developer Royalty & Platform Fee (100% Platform Fee + 25% of Branch Commission) - Admin Only
+    const totalPlatformFee = developerStatsRow ? Math.round(Number(developerStatsRow.total_platform_fee || 0)) : 0;
+    const todayPlatformFee = developerStatsRow ? Math.round(Number(developerStatsRow.today_platform_fee || 0)) : 0;
+    const developerCommissionCut = Math.round(totalAdminCommission * 0.25);
+    const developerTotalPayout = totalPlatformFee + developerCommissionCut;
+    const adminNetRetainedCommission = totalAdminCommission - developerCommissionCut;
 
     let salesGrowth = 0;
     if (yesterdaySales > 0) {
@@ -154,6 +334,26 @@ const DashboardModel = {
       cancelledOrders,
       totalCustomers,
       totalProducts,
+      storeNetPayable,
+      storeCommission,
+      onlineStorePayable,
+      codTotalAmount,
+      codCommission,
+      netStorePayout,
+      todayStoreEarnings,
+      mainBakeryRevenue,
+      mainBakeryOrders,
+      mainBakeryTodaySales,
+      branchStoresRevenue,
+      branchStoresOrders,
+      branchStoresTodaySales,
+      totalAdminCommission,
+      totalStorePayable,
+      totalPlatformFee,
+      todayPlatformFee,
+      developerCommissionCut,
+      developerTotalPayout,
+      adminNetRetainedCommission,
     };
   },
 
@@ -435,6 +635,8 @@ const DashboardModel = {
         "customer_name",
         "customer_email",
         "total_amount",
+        "store_payable_amount",
+        "admin_commission_amount",
         "payment_method",
         "payment_status",
         "status",
@@ -449,6 +651,8 @@ const DashboardModel = {
       customerName: r.customer_name,
       customerEmail: r.customer_email,
       totalAmount: Number(r.total_amount),
+      storePayableAmount: r.store_payable_amount != null ? Number(r.store_payable_amount) : null,
+      adminCommissionAmount: r.admin_commission_amount != null ? Number(r.admin_commission_amount) : 0,
       paymentMethod: r.payment_method,
       paymentStatus: r.payment_status,
       status: r.status,
@@ -512,3 +716,4 @@ const DashboardModel = {
 };
 
 module.exports = DashboardModel;
+                                                  

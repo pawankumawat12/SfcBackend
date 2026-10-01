@@ -160,6 +160,11 @@ const DEFAULT_ORDER_PRICING = {
   store_latitude: 26.9124,
   store_longitude: 75.7873,
   discount_percent: 0,
+  store_commission_type: "percent", // "percent" | "fixed"
+  store_commission_value: 10,       // 10% or fixed ₹10
+  store_commission_min_order_amount: 0, // min order amount threshold to charge commission
+  developer_commission_type: "percent", // "percent" | "fixed" (cut from store commission)
+  developer_commission_value: 25,       // 25% of store commission or fixed ₹5
 };
 
 async function getOrderPricingSettings() {
@@ -215,6 +220,22 @@ async function updateOrderPricingSettings(data) {
       data.discount_percent != null
         ? Number(data.discount_percent)
         : current.discount_percent,
+    store_commission_type:
+      data.store_commission_type ?? current.store_commission_type ?? "percent",
+    store_commission_value:
+      data.store_commission_value != null
+        ? Number(data.store_commission_value)
+        : current.store_commission_value ?? 10,
+    store_commission_min_order_amount:
+      data.store_commission_min_order_amount != null
+        ? Number(data.store_commission_min_order_amount)
+        : current.store_commission_min_order_amount ?? 0,
+    developer_commission_type:
+      data.developer_commission_type ?? current.developer_commission_type ?? "percent",
+    developer_commission_value:
+      data.developer_commission_value != null
+        ? Number(data.developer_commission_value)
+        : current.developer_commission_value ?? 25,
   };
   await setSetting("order_pricing", next);
   return next;

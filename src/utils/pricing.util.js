@@ -418,6 +418,58 @@ async function calculateCartAndOrderPricing({
     );
   }
 
+  // -------------------------------------------------------------
+  // Store Settlement & Admin Commission Calculation
+  // ONLY for Branch Stores - Main Bakery has NO commission deduction
+  // -------------------------------------------------------------
+  const isBranchStore = activeStoreType === "branch" && Boolean(activeStoreId);
+  const storeCommissionType = settings.store_commission_type || "percent";
+  const storeCommissionValue = Number(settings.store_commission_value ?? 10);
+  const storeCommissionMinOrder = Number(settings.store_commission_min_order_amount ?? 0);
+
+  let storeGrossAmount = 0;
+  let adminCommissionAmount = 0;
+  let storePayableAmount = 0;
+
+  if (isBranchStore) {
+    // Store Gross = Product Price (after discounts) + Delivery Fee + Packaging Fee
+    storeGrossAmount = roundCurrency(discountedSubtotal + deliveryFee + packagingFee);
+
+    if (rawSubtotal >= storeCommissionMinOrder) {
+      if (storeCommissionType === "fixed") {
+        adminCommissionAmount = roundCurrency(storeCommissionValue);
+      } else {
+        adminCommissionAmount = roundCurrency((discountedSubtotal * storeCommissionValue) / 100);
+      }
+    }
+
+    // Ensure commission doesn't exceed store gross
+    adminCommissionAmount = Math.min(adminCommissionAmount, storeGrossAmount);
+    storePayableAmount = Math.max(0, storeGrossAmount - adminCommissionAmount);
+  }
+
+  // -------------------------------------------------------------
+  // Developer Commission & Tech Royalty Calculation (Admin Only)
+  // 1. 100% of customer platform_fee goes to developer.
+  // 2. Developer also gets a share of the Admin Commission on branch orders.
+  // -------------------------------------------------------------
+  const developerCommissionType = settings.developer_commission_type || "percent";
+  const developerCommissionValue = Number(settings.developer_commission_value ?? 25);
+
+  const developerPlatformFee = platformFee; // 100% of platform fee
+  let developerCommissionShare = 0;
+
+  if (isBranchStore && adminCommissionAmount > 0) {
+    if (developerCommissionType === "fixed") {
+      developerCommissionShare = Math.min(adminCommissionAmount, roundCurrency(developerCommissionValue));
+    } else {
+      developerCommissionShare = roundCurrency((adminCommissionAmount * developerCommissionValue) / 100);
+    }
+  }
+
+  const adminNetCommission = Math.max(0, adminCommissionAmount - developerCommissionShare);
+  const developerTotalEarnings = roundCurrency(developerPlatformFee + developerCommissionShare);
+
   // Timer / validity window
   const now = new Date();
   const validitySeconds = 900; // 15 minutes quote lock
@@ -482,6 +534,22 @@ async function calculateCartAndOrderPricing({
     // Store Location snapshot
     store_latitude: (activeStore && activeStore.latitude != null) ? Number(activeStore.latitude) : settings.store_latitude,
     store_longitude: (activeStore && activeStore.longitude != null) ? Number(activeStore.longitude) : settings.store_longitude,
+
+    // Store Settlement & Admin Commission
+    store_gross_amount: storeGrossAmount,
+    admin_commission_amount: adminCommissionAmount,
+    store_payable_amount: storePayableAmount,
+    store_commission_type: storeCommissionType,
+    store_commission_value: storeCommissionValue,
+    store_commission_min_order_amount: storeCommissionMinOrder,
+
+    // Developer Royalty & Tech Earnings (Admin Only)
+    developer_platform_fee: developerPlatformFee,
+    developer_commission_share: developerCommissionShare,
+    developer_total_earnings: developerTotalEarnings,
+    admin_net_commission: adminNetCommission,
+    developer_commission_type: developerCommissionType,
+    developer_commission_value: developerCommissionValue,
 
     // Timer & Metadata
     currency: "INR",
