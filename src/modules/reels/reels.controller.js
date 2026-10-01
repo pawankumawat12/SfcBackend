@@ -33,6 +33,16 @@ function extractYouTubeId(url = "") {
   return match ? match[1] : null;
 }
 
+function optimizeReelUrl(url) {
+  if (!url || typeof url !== "string") return url;
+  if (url.includes("cloudinary.com") && url.includes("/video/upload/")) {
+    if (!url.includes("/video/upload/f_auto") && !url.includes("/video/upload/q_auto")) {
+      return url.replace("/video/upload/", "/video/upload/f_auto,q_auto,w_720,vc_auto/");
+    }
+  }
+  return url;
+}
+
 function resolveThumbnail(videoUrl, platform, customThumbnail) {
   if (customThumbnail && customThumbnail.trim()) {
     return customThumbnail.trim();
@@ -43,7 +53,31 @@ function resolveThumbnail(videoUrl, platform, customThumbnail) {
       return `https://img.youtube.com/vi/${ytId}/hqdefault.jpg`;
     }
   }
+  // Cloudinary auto-frame JPEG thumbnail extraction (seek 0.5s, 480w, web-ready JPG)
+  if (videoUrl && videoUrl.includes("cloudinary.com") && videoUrl.includes("/video/upload/")) {
+    let thumb = videoUrl.replace(
+      /\/video\/upload\/(?:[a-zA-Z0-9_,:]+\/)?/,
+      "/video/upload/so_0.5,w_480,q_auto,f_auto/"
+    );
+    thumb = thumb.replace(/\.(mp4|webm|mov|m4v)(\?.*)?$/i, ".jpg$2");
+    return thumb;
+  }
   return null;
+}
+
+function formatReelOutput(reel) {
+  if (!reel) return reel;
+  const optimizedVideoUrl = optimizeReelUrl(reel.video_url);
+  const resolvedThumbnail = resolveThumbnail(
+    optimizedVideoUrl,
+    reel.platform,
+    reel.thumbnail_url
+  );
+  return {
+    ...reel,
+    video_url: optimizedVideoUrl,
+    thumbnail_url: resolvedThumbnail,
+  };
 }
 
 // Public: Get all active reels for frontend slider
@@ -53,7 +87,7 @@ async function getPublicReelsHandler(req, res) {
     return res.status(200).json({
       success: true,
       message: "Active reels fetched successfully",
-      data: reels,
+      data: (reels || []).map(formatReelOutput),
     });
   } catch (error) {
     console.error("Get active reels error:", error);
@@ -68,7 +102,7 @@ async function getAdminReelsHandler(req, res) {
     return res.status(200).json({
       success: true,
       message: "Admin reels fetched successfully",
-      data: reels,
+      data: (reels || []).map(formatReelOutput),
     });
   } catch (error) {
     console.error("Get admin reels error:", error);
@@ -87,7 +121,7 @@ async function getReelByIdHandler(req, res) {
       return res.status(404).json({ success: false, message: "Reel not found" });
     }
 
-    return res.status(200).json({ success: true, data: reel });
+    return res.status(200).json({ success: true, data: formatReelOutput(reel) });
   } catch (error) {
     console.error("Get reel error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
