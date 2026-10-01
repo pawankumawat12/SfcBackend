@@ -373,6 +373,57 @@ async function updateDynamicQrSettings(data) {
   return next;
 }
 
+const DEFAULT_DEVELOPER_SETTINGS = {
+  is_enabled: true,
+  developer_name: "Pawan Kumawat",
+  developer_email: "pawankumawat9009@gmail.com",
+  developer_phone: "7690939596",
+  developer_whatsapp: "917690939596",
+  developer_tagline: "Custom Food Ordering Websites, Cafe Apps & Enterprise Software",
+  custom_inquiry_message: "Hi Pawan, I saw the SFC Bakers website and want to build a similar website/app for my business.",
+  show_in_frontend: true,
+  show_in_store_dashboard: true,
+};
+
+async function getDeveloperSettings() {
+  const current = await getSetting("developer_credits");
+  if (!current) return DEFAULT_DEVELOPER_SETTINGS;
+  return {
+    is_enabled: current.is_enabled !== undefined ? Boolean(current.is_enabled) : DEFAULT_DEVELOPER_SETTINGS.is_enabled,
+    developer_name: current.developer_name || DEFAULT_DEVELOPER_SETTINGS.developer_name,
+    developer_email: current.developer_email || DEFAULT_DEVELOPER_SETTINGS.developer_email,
+    developer_phone: current.developer_phone || DEFAULT_DEVELOPER_SETTINGS.developer_phone,
+    developer_whatsapp: current.developer_whatsapp || DEFAULT_DEVELOPER_SETTINGS.developer_whatsapp,
+    developer_tagline: current.developer_tagline || DEFAULT_DEVELOPER_SETTINGS.developer_tagline,
+    custom_inquiry_message: current.custom_inquiry_message || DEFAULT_DEVELOPER_SETTINGS.custom_inquiry_message,
+    show_in_frontend: current.show_in_frontend !== undefined ? Boolean(current.show_in_frontend) : true,
+    show_in_store_dashboard: current.show_in_store_dashboard !== undefined ? Boolean(current.show_in_store_dashboard) : true,
+  };
+}
+
+async function updateDeveloperSettings(data) {
+  const current = await getDeveloperSettings();
+  let whatsappNum = data.developer_whatsapp !== undefined ? String(data.developer_whatsapp).replace(/\D/g, "") : current.developer_whatsapp;
+  if (whatsappNum.length === 10) {
+    whatsappNum = `91${whatsappNum}`;
+  }
+
+  const next = {
+    is_enabled: data.is_enabled !== undefined ? Boolean(data.is_enabled) : current.is_enabled,
+    developer_name: data.developer_name !== undefined ? String(data.developer_name).trim() : current.developer_name,
+    developer_email: data.developer_email !== undefined ? String(data.developer_email).trim() : current.developer_email,
+    developer_phone: data.developer_phone !== undefined ? String(data.developer_phone).trim() : current.developer_phone,
+    developer_whatsapp: whatsappNum || current.developer_whatsapp,
+    developer_tagline: data.developer_tagline !== undefined ? String(data.developer_tagline).trim() : current.developer_tagline,
+    custom_inquiry_message: data.custom_inquiry_message !== undefined ? String(data.custom_inquiry_message).trim() : current.custom_inquiry_message,
+    show_in_frontend: data.show_in_frontend !== undefined ? Boolean(data.show_in_frontend) : current.show_in_frontend,
+    show_in_store_dashboard: data.show_in_store_dashboard !== undefined ? Boolean(data.show_in_store_dashboard) : current.show_in_store_dashboard,
+    updated_at: new Date().toISOString(),
+  };
+  await setSetting("developer_credits", next);
+  return next;
+}
+
 module.exports = {
   DEFAULT_COLOR_THEMES,
   getSetting,
@@ -396,4 +447,7 @@ module.exports = {
   DEFAULT_DYNAMIC_QR,
   getDynamicQrSettings,
   updateDynamicQrSettings,
+  DEFAULT_DEVELOPER_SETTINGS,
+  getDeveloperSettings,
+  updateDeveloperSettings,
 };

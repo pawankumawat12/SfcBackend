@@ -14,6 +14,8 @@ const {
   updateStoreStatusSettings,
   getDynamicQrSettings,
   updateDynamicQrSettings,
+  getDeveloperSettings,
+  updateDeveloperSettings,
 } = require("../../models/settings.model");
 const { generateQrSvg, generateQrDataUrl } = require("../../services/qrCode.service");
 const { testResendConnection, sendMail } = require("../../services/resend.service");
@@ -700,6 +702,40 @@ async function downloadDynamicQr(req, res) {
   }
 }
 
+async function getDeveloper(req, res) {
+  try {
+    const data = await getDeveloperSettings();
+    return res.status(200).json({
+      success: true,
+      message: "Developer settings fetched successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Get developer settings error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch developer settings",
+    });
+  }
+}
+
+async function updateDeveloper(req, res) {
+  try {
+    const data = await updateDeveloperSettings(req.body);
+    return res.status(200).json({
+      success: true,
+      message: "Developer settings updated successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Update developer settings error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update developer settings",
+    });
+  }
+}
+
 module.exports = {
   getTheme,
   updateTheme,
@@ -723,4 +759,6 @@ module.exports = {
   downloadDynamicQr,
   handleQrRedirect,
   getPublicQrDestination,
+  getDeveloper,
+  updateDeveloper,
 };

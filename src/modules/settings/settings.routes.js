@@ -24,6 +24,8 @@ const {
   downloadDynamicQr,
   handleQrRedirect,
   getPublicQrDestination,
+  getDeveloper,
+  updateDeveloper,
 } = require("./settings.controller");
 
 const router = express.Router();
@@ -42,6 +44,10 @@ router.put("/logo", verifyToken, isAdmin, uploadImage.single("logo"), updateLogo
 
 router.get("/order-pricing", getOrderPricing);
 router.put("/order-pricing", verifyToken, isAdmin, updateOrderPricing);
+
+// Developer Attribution & Inquiries Settings
+router.get("/developer", getDeveloper);
+router.put("/developer", verifyToken, isAdmin, updateDeveloper);
 
 // Resend Email Settings
 router.get("/email", verifyToken, isAdmin, getResend);
