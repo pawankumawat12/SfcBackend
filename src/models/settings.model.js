@@ -201,8 +201,19 @@ async function updateOrderPricingSettings(data) {
         : current.packaging_fee,
     cod_fee: data.cod_fee != null ? Number(data.cod_fee) : current.cod_fee,
     platform_fee:
-      data.platform_fee != null
-        ? Number(data.platform_fee)
+      data.platform_fee != null &&
+      !isNaN(
+        Number(
+          Array.isArray(data.platform_fee)
+            ? data.platform_fee[data.platform_fee.length - 1]
+            : data.platform_fee
+        )
+      )
+        ? Number(
+            Array.isArray(data.platform_fee)
+              ? data.platform_fee[data.platform_fee.length - 1]
+              : data.platform_fee
+          )
         : current.platform_fee,
     minimum_order_amount:
       data.minimum_order_amount != null

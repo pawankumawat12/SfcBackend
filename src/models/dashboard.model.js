@@ -119,9 +119,9 @@ const DashboardModel = {
       // Cancelled orders
       baseOrders().whereRaw("LOWER(status) = 'cancelled'").count("id as count").first(),
 
-      // Total customers (users with role 'user' or 'customer', or users who ordered from store)
+      // Total customers (users with role 'user' or 'customer') - Admin only (Store owners cannot view customer metrics)
       storeId
-        ? baseOrders().countDistinct("user_id as count").first()
+        ? Promise.resolve({ count: 0 })
         : db("users").whereIn("role", ["user", "customer"]).count("id as count").first(),
 
       // Total products
@@ -648,8 +648,8 @@ const DashboardModel = {
     return rows.map((r) => ({
       id: Number(r.id),
       orderNumber: r.order_number,
-      customerName: r.customer_name,
-      customerEmail: r.customer_email,
+      customerName: storeId ? undefined : r.customer_name,
+      customerEmail: storeId ? undefined : r.customer_email,
       totalAmount: Number(r.total_amount),
       storePayableAmount: r.store_payable_amount != null ? Number(r.store_payable_amount) : null,
       adminCommissionAmount: r.admin_commission_amount != null ? Number(r.admin_commission_amount) : 0,
@@ -661,13 +661,14 @@ const DashboardModel = {
   },
 
   /**
-   * Get recent customer activity feed
+   * Get recent customer activity feed (Admin Only)
    */
   async getRecentActivities(limit = 6, storeId = null) {
-    let ordersQuery = db("orders");
     if (storeId) {
-      ordersQuery = ordersQuery.where("store_id", storeId).where("is_forwarded_to_store", true);
+      return [];
     }
+
+    let ordersQuery = db("orders");
 
     const [recentOrders, recentReviews, recentInquiries] = await Promise.all([
       ordersQuery

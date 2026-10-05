@@ -725,6 +725,26 @@ async function getOrderDetails(req, res) {
 
     const enrichedOrder = attachCancellationMeta(order, req.user?.role);
 
+    if (req.user?.role === "store_owner") {
+      enrichedOrder.customer_email = null;
+      enrichedOrder.customer_phone = null;
+      enrichedOrder.customer_name = "Customer";
+      if (enrichedOrder.delivery_address_json) {
+        try {
+          const parsed =
+            typeof enrichedOrder.delivery_address_json === "string"
+              ? JSON.parse(enrichedOrder.delivery_address_json)
+              : enrichedOrder.delivery_address_json;
+          if (parsed && typeof parsed === "object") {
+            delete parsed.phone_number;
+            enrichedOrder.delivery_address_json = parsed;
+          }
+        } catch {
+          // ignore parsing error
+        }
+      }
+    }
+
     return res.status(200).json({
       success: true,
       message: "Order details fetched successfully",
@@ -779,10 +799,21 @@ async function getAdminOrders(req, res) {
       endDate,
     });
 
+    let ordersList = result.orders;
+    if (req.user.role === "store_owner") {
+      ordersList = (result.orders || []).map((order) => {
+        const sanitized = { ...order };
+        delete sanitized.customer_email;
+        delete sanitized.customer_phone;
+        sanitized.customer_name = "Customer";
+        return sanitized;
+      });
+    }
+
     return res.status(200).json({
       success: true,
       message: "Orders fetched successfully",
-      data: result.orders,
+      data: ordersList,
       pagination: result.pagination,
       stats: result.stats,
       summary: result.stats,
