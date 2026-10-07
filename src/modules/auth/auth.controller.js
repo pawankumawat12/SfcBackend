@@ -219,19 +219,19 @@ const forgotPassword = async (req, res) => {
       return res.status(404).json({ message: "Email does not exist" });
     }
 
-    // Role-based authorization: prevent admin accounts from resetting via customer frontend, and vice-versa
+    // Role-based authorization: allow admin and store_owner on admin portal, prevent customer storefront from resetting them
     const origin = String(req.headers.origin || req.headers.referer || "");
     const isAdminSource = requestedRole === "admin" || origin.includes("5173");
 
     if (isAdminSource) {
-      if (user.role !== "admin") {
+      if (user.role !== "admin" && user.role !== "store_owner") {
         return res.status(403).json({
           message: "Email does not exist",
         });
       }
     } else {
       // Customer frontend source
-      if (user.role === "admin") {
+      if (user.role === "admin" || user.role === "store_owner") {
         return res.status(403).json({
           message: "Email does not exist",
         });
