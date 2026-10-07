@@ -72,6 +72,15 @@ async function listProducts(req, res) {
       filters.includeAdmin = true;
     }
 
+    const includePos =
+      req.query.include_pos === "true" ||
+      req.query.include_pos === true ||
+      req.query.scope === "pos";
+    const posOnly = req.query.pos_only === "true" || req.query.pos_only === true;
+
+    filters.includePos = includePos;
+    filters.posOnly = posOnly;
+
     const adminOnly =
       req.query.admin_only === "true" ||
       req.query.admin_only === true ||
@@ -182,6 +191,8 @@ async function createProductHandler(req, res) {
       storeId: bodyStoreIdCamel,
     } = req.body || {};
 
+    const isPosOnly = req.body?.is_pos_only === "true" || req.body?.is_pos_only === true;
+
     let initialImages = [];
     if (req.files && req.files.length > 0) {
       initialImages = req.files;
@@ -194,6 +205,9 @@ async function createProductHandler(req, res) {
       if (!Array.isArray(initialImages)) {
         initialImages = [initialImages];
       }
+    } else if (isPosOnly) {
+      // Default food/beverage placeholder for instant POS counter product creation
+      initialImages = ["https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400&q=80"];
     }
 
     const { valid, errors, data } = validateProductCreate({
@@ -232,7 +246,7 @@ async function createProductHandler(req, res) {
 
       // Check that store owner has set their store location on the map before adding products
       const store = await db("stores").where({ id: storeId }).first();
-      if (!store || store.latitude == null || store.longitude == null) {
+      if (!isPosOnly && (!store || store.latitude == null || store.longitude == null)) {
         return res.status(400).json({
           success: false,
           code: "STORE_LOCATION_REQUIRED",
@@ -244,7 +258,7 @@ async function createProductHandler(req, res) {
         .where({ store_id: storeId, category_id: data.category_id })
         .first();
 
-      if (!isCategoryAssigned) {
+      if (!isPosOnly && !isCategoryAssigned) {
         return res.status(403).json({
           message: "You can only add products to the categories assigned to your store by the administrator.",
         });
@@ -291,6 +305,7 @@ async function createProductHandler(req, res) {
     }
 
     data.storage_provider = uploadedResults[0]?.provider || "cloudinary";
+    data.is_pos_only = Boolean(isPosOnly);
 
     const product = await createProduct(data);
     const productWithCategory = await findProductById(product.id);
@@ -455,6 +470,9 @@ async function updateProductHandler(req, res) {
     data.images = [...keptImages, ...newImageUrls];
     data.image_keys = [...keptKeys, ...newImageKeys];
     data.storage_provider = "cloudinary";
+    if (req.body.is_pos_only !== undefined) {
+      data.is_pos_only = req.body.is_pos_only === "true" || req.body.is_pos_only === true;
+    }
 
     await updateProduct(id, data);
 

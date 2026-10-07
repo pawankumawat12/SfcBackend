@@ -36,6 +36,7 @@ const { incrementOfferUsage } = require("../../models/offer.model");
 const { generateInvoicePdf } = require("../../services/invoice.service");
 const { getStoreStatusSettings } = require("../../models/settings.model");
 const { roundCurrency } = require("../../utils/pricing.util");
+const { deductIngredientStockForOrder, restoreIngredientStockForOrder } = require("../../services/inventory.service");
 
 async function createOrder(req, res) {
   try {
@@ -1986,8 +1987,343 @@ async function downloadInvoiceHandler(req, res) {
   }
 }
 
+function generatePosOrderNumber() {
+  const timestamp = Date.now().toString().slice(-5);
+  const random = Math.floor(100 + Math.random() * 900);
+  return `POS-${timestamp}${random}`;
+}
+
+async function createPosSaleController(req, res) {
+  try {
+    const cashierUser = req.user;
+    const {
+      customerName = "Walk-in Customer",
+      customerPhone = "",
+      items = [],
+      subtotal = 0,
+      discount = 0,
+      tax = 0,
+      totalAmount = 0,
+      paymentMethod = "Cash",
+      receivedAmount = 0,
+      changeAmount = 0,
+      notes = "",
+    } = req.body || {};
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ success: false, message: "No items in POS cart" });
+    }
+
+    const effectiveStoreId = cashierUser?.role === "store_owner"
+      ? (await getStoreIdForUser(cashierUser))
+      : (req.body.storeId ? Number(req.body.storeId) : null);
+
+    const orderNumber = generatePosOrderNumber();
+
+    const createdOrder = await db.transaction(async (trx) => {
+      // 1. Insert into orders table
+      const [order] = await trx("orders")
+        .insert({
+          order_number: orderNumber,
+          user_id: cashierUser.id,
+          store_id: effectiveStoreId,
+          customer_name: customerName || "Walk-in Customer",
+          customer_phone: customerPhone || "",
+          shipping_address: "In-Store / POS Counter",
+          subtotal: roundCurrency(Number(subtotal) || 0),
+          discount: roundCurrency(Number(discount) || 0),
+          tax_amount: roundCurrency(Number(tax) || 0),
+          total_amount: roundCurrency(Number(totalAmount) || 0),
+          status: "Delivered",
+          payment_status: "Paid",
+          payment_method: paymentMethod || "Cash",
+          notes: notes || `POS Sale (Cashier: ${cashierUser.name || cashierUser.email}, Received: ₹${receivedAmount || totalAmount}, Change: ₹${changeAmount || 0})`,
+          created_at: trx.fn.now(),
+          updated_at: trx.fn.now(),
+        })
+        .returning("*");
+
+      // 2. Insert order items & decrement stock
+      for (const item of items) {
+        const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+        const price = Number(item.price) || 0;
+        const productId = item.id || item.product_id;
+        const productName = item.name || item.product_name || `Product #${productId || "Item"}`;
+
+        let image = null;
+        if (item.images) {
+          try {
+            const parsed = typeof item.images === "string" ? JSON.parse(item.images) : item.images;
+            if (Array.isArray(parsed) && parsed.length > 0) image = parsed[0];
+          } catch {
+            image = typeof item.images === "string" ? item.images : null;
+          }
+        }
+
+        // Insert into order_items
+        const orderItemRow = {
+          order_id: order.id,
+          product_id: productId || null,
+          product_name: productName,
+          price: price,
+          quantity: qty,
+          total: roundCurrency(price * qty),
+          image: image,
+          created_at: trx.fn.now(),
+          updated_at: trx.fn.now(),
+        };
+
+        if (effectiveStoreId) {
+          orderItemRow.store_id = effectiveStoreId;
+        }
+
+        await trx("order_items").insert(orderItemRow);
+
+        // Decrement product stock directly in database
+        if (productId) {
+          await trx("products")
+            .where({ id: productId })
+            .update({
+              stock: trx.raw("GREATEST(0, COALESCE(stock, 0) - ?)", [qty]),
+              updated_at: trx.fn.now(),
+            });
+        }
+      }
+
+      // 3. Deduct raw material ingredients based on product recipes (BOM)
+      try {
+        await deductIngredientStockForOrder(order.id, trx);
+      } catch (ingErr) {
+        console.warn("[POS Sale] Recipe ingredient deduction notice:", ingErr.message);
+      }
+
+      return order;
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "POS sale completed successfully",
+      order: createdOrder,
+    });
+  } catch (error) {
+    console.error("Create POS sale error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to process POS sale" });
+  }
+}
+
+async function getPosSalesHistoryController(req, res) {
+  try {
+    const { page = 1, limit = 20, search = "", startDate, endDate } = req.query;
+    const p = Math.max(1, Number(page) || 1);
+    const l = Math.max(1, Math.min(100, Number(limit) || 20));
+    const offset = (p - 1) * l;
+
+    let baseQuery = db("orders as o")
+      .where(function () {
+        this.where("o.order_number", "like", "POS-%")
+          .orWhere("o.shipping_address", "like", "%POS Counter%")
+          .orWhere("o.shipping_address", "like", "%In-Store%");
+      });
+
+    if (search && String(search).trim()) {
+      const s = `%${String(search).trim()}%`;
+      baseQuery = baseQuery.where(function () {
+        this.whereILike("o.order_number", s)
+          .orWhereILike("o.customer_name", s)
+          .orWhereILike("o.customer_phone", s)
+          .orWhereILike("o.notes", s);
+      });
+    }
+
+    if (startDate) {
+      baseQuery = baseQuery.where("o.created_at", ">=", startDate);
+    }
+    if (endDate) {
+      baseQuery = baseQuery.where("o.created_at", "<=", endDate);
+    }
+
+    const [countRow, salesRows] = await Promise.all([
+      baseQuery.clone().count("o.id as count").first(),
+      baseQuery.clone().orderBy("o.created_at", "desc").limit(l).offset(offset),
+    ]);
+
+    const total = Number(countRow?.count || 0);
+    const orderIds = salesRows.map((o) => o.id);
+
+    let itemsByOrder = {};
+    if (orderIds.length > 0) {
+      const items = await db("order_items").whereIn("order_id", orderIds).orderBy("id", "asc");
+      items.forEach((item) => {
+        if (!itemsByOrder[item.order_id]) itemsByOrder[item.order_id] = [];
+        itemsByOrder[item.order_id].push(item);
+      });
+    }
+
+    const sales = salesRows.map((o) => ({
+      ...o,
+      items: itemsByOrder[o.id] || [],
+    }));
+
+    return res.status(200).json({
+      success: true,
+      data: sales,
+      pagination: {
+        total,
+        page: p,
+        limit: l,
+        totalPages: Math.ceil(total / l) || 1,
+      },
+    });
+  } catch (error) {
+    console.error("Get POS sales history error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to fetch POS sales history" });
+  }
+}
+
+async function updatePosSaleController(req, res) {
+  try {
+    const orderId = Number(req.params.id);
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
+
+    const {
+      customerName,
+      customerPhone,
+      items = [],
+      subtotal = 0,
+      discount = 0,
+      tax = 0,
+      totalAmount = 0,
+      paymentMethod = "Cash",
+      notes = "",
+    } = req.body || {};
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ success: false, message: "Sale must have at least one product" });
+    }
+
+    const existingOrder = await db("orders").where({ id: orderId }).first();
+    if (!existingOrder) {
+      return res.status(404).json({ success: false, message: "POS order not found" });
+    }
+
+    const updatedOrder = await db.transaction(async (trx) => {
+      // 1. Fetch current items of this order to reverse their product stock
+      const oldItems = await trx("order_items").where({ order_id: orderId });
+      for (const oldItem of oldItems) {
+        const oldPid = oldItem.product_id;
+        const oldQty = Number(oldItem.quantity) || 1;
+        if (oldPid) {
+          // Re-add stock back
+          await trx("products")
+            .where({ id: oldPid })
+            .update({
+              stock: trx.raw("COALESCE(stock, 0) + ?", [oldQty]),
+              updated_at: trx.fn.now(),
+            });
+        }
+      }
+
+      // 2. Restore previous recipe ingredients if they were deducted
+      if (existingOrder.ingredient_stock_deducted && !existingOrder.ingredient_stock_restored) {
+        try {
+          await restoreIngredientStockForOrder(orderId, trx);
+        } catch (resErr) {
+          console.warn("[POS Edit] Ingredient restore notice:", resErr.message);
+        }
+      }
+
+      // Reset ingredient deduction flags so new deduction applies cleanly
+      await trx("orders").where({ id: orderId }).update({
+        ingredient_stock_deducted: false,
+        ingredient_stock_restored: false,
+      });
+
+      // 3. Delete old order_items rows
+      await trx("order_items").where({ order_id: orderId }).del();
+
+      // 4. Update the order with new financial details
+      const [order] = await trx("orders")
+        .where({ id: orderId })
+        .update({
+          customer_name: customerName || existingOrder.customer_name || "Walk-in Customer",
+          customer_phone: customerPhone != null ? customerPhone : existingOrder.customer_phone,
+          subtotal: roundCurrency(Number(subtotal) || 0),
+          discount: roundCurrency(Number(discount) || 0),
+          tax_amount: roundCurrency(Number(tax) || 0),
+          total_amount: roundCurrency(Number(totalAmount) || 0),
+          payment_method: paymentMethod || existingOrder.payment_method || "Cash",
+          notes: notes != null ? notes : existingOrder.notes,
+          updated_at: trx.fn.now(),
+        })
+        .returning("*");
+
+      // 5. Insert new items and deduct new product stock
+      for (const item of items) {
+        const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+        const price = Number(item.price) || 0;
+        const productId = item.id || item.product_id;
+        const productName = item.name || item.product_name || `Product #${productId || "Item"}`;
+
+        let image = null;
+        if (item.images) {
+          try {
+            const parsed = typeof item.images === "string" ? JSON.parse(item.images) : item.images;
+            if (Array.isArray(parsed) && parsed.length > 0) image = parsed[0];
+          } catch {
+            image = typeof item.images === "string" ? item.images : null;
+          }
+        }
+
+        await trx("order_items").insert({
+          order_id: orderId,
+          product_id: productId || null,
+          product_name: productName,
+          price: price,
+          quantity: qty,
+          total: roundCurrency(price * qty),
+          image: image,
+          created_at: trx.fn.now(),
+          updated_at: trx.fn.now(),
+        });
+
+        if (productId) {
+          await trx("products")
+            .where({ id: productId })
+            .update({
+              stock: trx.raw("GREATEST(0, COALESCE(stock, 0) - ?)", [qty]),
+              updated_at: trx.fn.now(),
+            });
+        }
+      }
+
+      // 6. Deduct new raw materials ingredients based on updated items
+      try {
+        await deductIngredientStockForOrder(orderId, trx);
+      } catch (ingErr) {
+        console.warn("[POS Edit] New ingredient deduction notice:", ingErr.message);
+      }
+
+      return order;
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "POS sale updated successfully. Revenue and stock refreshed.",
+      order: updatedOrder,
+    });
+  } catch (error) {
+    console.error("Update POS sale error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to update POS sale" });
+  }
+}
+
 module.exports = {
   createOrder,
+  createPosSaleController,
+  getPosSalesHistoryController,
+  updatePosSaleController,
   getUserOrders,
   getOrderDetails,
   getAdminOrders,

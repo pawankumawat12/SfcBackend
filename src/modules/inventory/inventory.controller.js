@@ -146,6 +146,8 @@ async function getIngredients(req, res, next) {
       if (!storeId) {
         return res.status(403).json({ success: false, message: "No store associated with this account" });
       }
+    } else if (req.query.admin_only === "true" || req.query.admin_only === true) {
+      storeId = null; // Strictly only Admin's central raw materials (store_id IS NULL)
     } else if (req.query.store_id !== undefined) {
       storeId = Number(req.query.store_id);
     }

@@ -6,6 +6,19 @@ const {
   getApplicableOffersForProduct,
 } = require("./offer.model");
 
+let productSchemaChecked = false;
+async function ensureProductColumns() {
+  if (productSchemaChecked) return;
+  try {
+    await db.raw(`
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS is_pos_only BOOLEAN DEFAULT FALSE;
+    `);
+    productSchemaChecked = true;
+  } catch (err) {
+    console.warn("[Product Model] Schema self-heal notice:", err.message);
+  }
+}
+
 const PRODUCT_COLUMNS = [
   "products.id",
   "products.name",
@@ -17,6 +30,7 @@ const PRODUCT_COLUMNS = [
   "products.category_id",
   "products.store_id",
   "products.is_active",
+  "products.is_pos_only",
   "products.image_keys",
   "products.storage_provider",
   "products.created_at",
@@ -77,10 +91,13 @@ function findProducts({
   adminOnly = false,
   isActive,
   availabilityType,
+  includePos = false,
+  posOnly = false,
   search,
   sortBy = "products.created_at",
   sortOrder = "desc",
 }) {
+  ensureProductColumns().catch(() => {});
   let query = db("products")
     .select([
       ...PRODUCT_COLUMNS,
@@ -115,6 +132,14 @@ function findProducts({
     query = query.where("products.availability_type", availabilityType);
   }
 
+  if (posOnly) {
+    query = query.where("products.is_pos_only", true);
+  } else if (!includePos) {
+    query = query.where(function () {
+      this.whereNull("products.is_pos_only").orWhere("products.is_pos_only", false);
+    });
+  }
+
   if (search) {
     query = query.where(function () {
       this.whereILike("products.name", `%${search}%`).orWhereILike(
@@ -131,7 +156,18 @@ function findProducts({
     .offset(offset);
 }
 
-function countProducts({ categoryId, storeId, includeAdmin = false, adminOnly = false, isActive, availabilityType, search }) {
+function countProducts({
+  categoryId,
+  storeId,
+  includeAdmin = false,
+  adminOnly = false,
+  isActive,
+  availabilityType,
+  includePos = false,
+  posOnly = false,
+  search,
+}) {
+  ensureProductColumns().catch(() => {});
   let query = db("products");
 
   if (categoryId !== undefined) {
@@ -150,6 +186,14 @@ function countProducts({ categoryId, storeId, includeAdmin = false, adminOnly = 
 
   if (availabilityType !== undefined) {
     query = query.where({ availability_type: availabilityType });
+  }
+
+  if (posOnly) {
+    query = query.where("products.is_pos_only", true);
+  } else if (!includePos) {
+    query = query.where(function () {
+      this.whereNull("products.is_pos_only").orWhere("products.is_pos_only", false);
+    });
   }
 
   if (search) {
@@ -176,6 +220,7 @@ function countProductsByCategory(categoryId) {
 }
 
 function createProduct(data) {
+  ensureProductColumns().catch(() => {});
   return db("products")
     .insert(serializeImages(data))
     .returning([
@@ -189,6 +234,7 @@ function createProduct(data) {
       "category_id",
       "store_id",
       "is_active",
+      "is_pos_only",
       "created_at",
       "updated_at",
     ])
@@ -196,6 +242,7 @@ function createProduct(data) {
 }
 
 function updateProduct(id, data) {
+  ensureProductColumns().catch(() => {});
   return db("products")
     .where({ id })
     .update(serializeImages(data))
@@ -209,6 +256,7 @@ function updateProduct(id, data) {
       "images",
       "category_id",
       "is_active",
+      "is_pos_only",
       "created_at",
       "updated_at",
     ])

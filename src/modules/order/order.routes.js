@@ -2,6 +2,9 @@ const express = require("express");
 const { verifyToken, isAdmin, isAdminOrStoreOwner } = require("../../../middleware/auth.middleware");
 const {
   createOrder,
+  createPosSaleController,
+  getPosSalesHistoryController,
+  updatePosSaleController,
   getUserOrders,
   getOrderDetails,
   getAdminOrders,
@@ -30,6 +33,9 @@ router.post("/webhook/razorpay", handleRazorpayWebhook);
 
 // Authenticated customer & admin routes
 router.use(verifyToken);
+router.post("/pos/sale", isAdminOrStoreOwner, createPosSaleController);
+router.get("/pos/history", isAdminOrStoreOwner, getPosSalesHistoryController);
+router.put("/pos/sale/:id", isAdminOrStoreOwner, updatePosSaleController);
 router.get("/export", isAdmin, exportOrdersHandler);
 router.post("/bulk-status", isAdmin, bulkUpdateOrderStatusHandler);
 router.post("/", orderCreateLimiter, idempotencyMiddleware, createOrder);

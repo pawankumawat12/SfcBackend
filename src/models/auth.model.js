@@ -258,9 +258,9 @@ async function listCustomers({
             LOWER(orders.status) NOT IN ('cancelled', 'pending payment', 'payment failed')
             AND LOWER(COALESCE(orders.payment_status, '')) NOT IN ('refunded', 'failed')
             AND (
-              (orders.payment_method = 'Online Payment' AND orders.payment_status IN ('Paid', 'Partially Refunded'))
-              OR
-              (orders.payment_method = 'Cash on Delivery' AND (LOWER(orders.status) IN ('delivered', 'completed') OR orders.payment_status = 'Paid'))
+              orders.payment_status IN ('Paid', 'Partially Refunded')
+              OR (orders.payment_method = 'Online Payment' AND orders.payment_status IN ('Paid', 'Partially Refunded'))
+              OR (orders.payment_method = 'Cash on Delivery' AND (LOWER(orders.status) IN ('delivered', 'completed') OR orders.payment_status = 'Paid'))
             )
           )
           THEN orders.total_amount
