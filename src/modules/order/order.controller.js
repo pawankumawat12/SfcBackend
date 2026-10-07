@@ -2034,6 +2034,10 @@ async function createPosSaleController(req, res) {
           discount: roundCurrency(Number(discount) || 0),
           tax_amount: roundCurrency(Number(tax) || 0),
           total_amount: roundCurrency(Number(totalAmount) || 0),
+          store_gross_amount: roundCurrency(Number(totalAmount) || 0),
+          store_payable_amount: roundCurrency(Number(totalAmount) || 0),
+          admin_commission_amount: 0,
+          is_forwarded_to_store: true,
           status: "Delivered",
           payment_status: "Paid",
           payment_method: paymentMethod || "Cash",
@@ -2099,6 +2103,11 @@ async function createPosSaleController(req, res) {
 
       return order;
     });
+
+    try {
+      emitToAdmin("admin_new_order", createdOrder);
+      emitToAdmin("admin_order_updated", createdOrder);
+    } catch (sErr) {}
 
     return res.status(201).json({
       success: true,
@@ -2283,6 +2292,10 @@ async function updatePosSaleController(req, res) {
           discount: roundCurrency(Number(discount) || 0),
           tax_amount: roundCurrency(Number(tax) || 0),
           total_amount: roundCurrency(Number(totalAmount) || 0),
+          store_gross_amount: roundCurrency(Number(totalAmount) || 0),
+          store_payable_amount: roundCurrency(Number(totalAmount) || 0),
+          admin_commission_amount: 0,
+          is_forwarded_to_store: true,
           payment_method: paymentMethod || existingOrder.payment_method || "Cash",
           notes: notes != null ? notes : existingOrder.notes,
           updated_at: trx.fn.now(),
@@ -2338,6 +2351,11 @@ async function updatePosSaleController(req, res) {
 
       return order;
     });
+
+    try {
+      emitToAdmin("admin_order_updated", updatedOrder);
+      emitToAdmin("admin_order_status_updated", updatedOrder);
+    } catch (sErr) {}
 
     return res.status(200).json({
       success: true,

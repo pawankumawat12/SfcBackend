@@ -57,10 +57,44 @@ const DashboardModel = {
     yesterdayStart.setDate(yesterdayStart.getDate() - 1);
     const yesterdayEnd = new Date(todayStart);
 
+    try {
+      await db("orders")
+        .where(function () {
+          this.where("shipping_address", "like", "%In-Store%")
+            .orWhere("order_number", "like", "POS-%");
+        })
+        .where(function () {
+          this.where("is_forwarded_to_store", false)
+            .orWhereNull("is_forwarded_to_store")
+            .orWhereNull("store_payable_amount")
+            .orWhere("store_payable_amount", 0);
+        })
+        .update({
+          is_forwarded_to_store: true,
+          store_payable_amount: db.raw("COALESCE(NULLIF(store_payable_amount, 0), total_amount)"),
+          store_gross_amount: db.raw("COALESCE(NULLIF(store_gross_amount, 0), total_amount)"),
+          admin_commission_amount: 0,
+        });
+    } catch (healErr) {}
+
     const baseOrders = () => {
       let q = db("orders");
       if (storeId) {
-        q = q.where("store_id", storeId).where("is_forwarded_to_store", true);
+        q = q.where("orders.store_id", storeId).where(function () {
+          this.where("orders.is_forwarded_to_store", true)
+            .orWhere("orders.shipping_address", "like", "%In-Store%")
+            .orWhere("orders.order_number", "like", "POS-%");
+        });
+      } else {
+        // Admin View: Exclude store-level POS counter orders. Only admin direct orders and forwarded online orders.
+        q = q.where(function () {
+          this.whereNull("orders.store_id").orWhere(function () {
+            this.whereNotNull("orders.store_id")
+              .where("orders.is_forwarded_to_store", true)
+              .whereNot("orders.shipping_address", "like", "%In-Store%")
+              .whereNot("orders.order_number", "like", "POS-%");
+          });
+        });
       }
       return q;
     };
@@ -81,6 +115,8 @@ const DashboardModel = {
       branchStoresStatsRow,
       branchStoresTodayRow,
       developerStatsRow,
+      allPosStatsRow,
+      allOnlineStatsRow,
     ] = await Promise.all([
       // Total orders
       baseOrders().count("id as count").first(),
@@ -150,7 +186,62 @@ const DashboardModel = {
               db.raw(`
                 COALESCE(SUM(
                   CASE 
-                    WHEN NOT (LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%')
+                    WHEN (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                    THEN orders.total_amount
+                    ELSE 0
+                  END
+                ), 0)::float as pos_total_sales
+              `),
+              db.raw(`
+                COALESCE(COUNT(
+                  CASE 
+                    WHEN (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                    THEN orders.id
+                  END
+                ), 0)::int as pos_orders_count
+              `),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                         AND orders.created_at >= '${todayStart.toISOString()}'
+                    THEN orders.total_amount
+                    ELSE 0
+                  END
+                ), 0)::float as pos_today_sales
+              `),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN NOT (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                    THEN orders.total_amount
+                    ELSE 0
+                  END
+                ), 0)::float as online_orders_sales
+              `),
+              db.raw(`
+                COALESCE(COUNT(
+                  CASE 
+                    WHEN NOT (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                    THEN orders.id
+                  END
+                ), 0)::int as online_orders_count
+              `),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN NOT (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                         AND orders.created_at >= '${todayStart.toISOString()}'
+                    THEN orders.total_amount
+                    ELSE 0
+                  END
+                ), 0)::float as online_today_sales
+              `),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN NOT (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                         AND NOT (LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%')
                     THEN COALESCE(
                       NULLIF(orders.store_payable_amount, 0),
                       NULLIF(orders.store_gross_amount, 0),
@@ -163,7 +254,8 @@ const DashboardModel = {
               db.raw(`
                 COALESCE(SUM(
                   CASE 
-                    WHEN LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%'
+                    WHEN NOT (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                         AND (LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%')
                     THEN orders.total_amount
                     ELSE 0
                   END
@@ -172,7 +264,8 @@ const DashboardModel = {
               db.raw(`
                 COALESCE(SUM(
                   CASE 
-                    WHEN LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%'
+                    WHEN NOT (orders.shipping_address LIKE '%In-Store%' OR orders.order_number LIKE 'POS-%')
+                         AND (LOWER(COALESCE(orders.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(orders.payment_method, '')) LIKE '%cod%')
                     THEN COALESCE(orders.admin_commission_amount, 0)
                     ELSE 0
                   END
@@ -195,13 +288,16 @@ const DashboardModel = {
             .first()
         : Promise.resolve(null),
 
-      // Main Bakery direct realized stats (only for Admin when !storeId)
-      // Orders without store_id OR orders not forwarded to store (fulfilled/delivered directly by Admin)
+      // Main Bakery direct realized online stats (only for Admin when !storeId)
+      // Excludes in-store POS bills so they can be shown in their own dedicated POS Counter card
       !storeId
         ? applyRevenueOrderFilter(
-            db("orders").where(function () {
-              this.whereNull("store_id").orWhere("is_forwarded_to_store", false);
-            })
+            db("orders")
+              .where(function () {
+                this.whereNull("store_id").orWhere("is_forwarded_to_store", false);
+              })
+              .whereNot("shipping_address", "like", "%In-Store%")
+              .whereNot("order_number", "like", "POS-%")
           )
             .select(
               db.raw("COUNT(id) as main_bakery_orders"),
@@ -216,6 +312,8 @@ const DashboardModel = {
             .where(function () {
               this.whereNull("store_id").orWhere("is_forwarded_to_store", false);
             })
+            .whereNot("shipping_address", "like", "%In-Store%")
+            .whereNot("order_number", "like", "POS-%")
             .where("created_at", ">=", todayStart)
             .whereRaw("LOWER(status) != 'cancelled'")
             .select(
@@ -226,12 +324,14 @@ const DashboardModel = {
         : Promise.resolve(null),
 
       // Branch Stores realized stats & Admin commission (only for Admin when !storeId)
-      // Only orders that were actively dispatched/forwarded to a branch store
+      // Strictly ONLY ONLINE orders that were forwarded to a branch store (EXCLUDE store POS counter sales)
       !storeId
         ? applyRevenueOrderFilter(
             db("orders")
               .whereNotNull("store_id")
               .where("is_forwarded_to_store", true)
+              .whereNot("shipping_address", "like", "%In-Store%")
+              .whereNot("order_number", "like", "POS-%")
           )
             .select(
               db.raw("COUNT(id) as branch_orders"),
@@ -250,11 +350,13 @@ const DashboardModel = {
             .first()
         : Promise.resolve(null),
 
-      // Branch Stores Today stats (only for Admin when !storeId)
+      // Branch Stores Today stats (only for Admin when !storeId - strictly online orders)
       !storeId
         ? db("orders")
             .whereNotNull("store_id")
             .where("is_forwarded_to_store", true)
+            .whereNot("shipping_address", "like", "%In-Store%")
+            .whereNot("order_number", "like", "POS-%")
             .where("created_at", ">=", todayStart)
             .whereRaw("LOWER(status) != 'cancelled'")
             .select(
@@ -281,6 +383,58 @@ const DashboardModel = {
             )
             .first()
         : Promise.resolve(null),
+
+      // Main Bakery POS Counter Stats (Admin Only when !storeId - branch store POS strictly excluded)
+      !storeId
+        ? applyRevenueOrderFilter(db("orders"))
+            .whereNull("store_id")
+            .where(function () {
+              this.where("shipping_address", "like", "%In-Store%").orWhere("order_number", "like", "POS-%");
+            })
+            .select(
+              db.raw("COUNT(id) as pos_orders"),
+              db.raw("COALESCE(SUM(total_amount), 0)::float as pos_revenue"),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN created_at >= '${todayStart.toISOString()}'
+                    THEN total_amount
+                    ELSE 0
+                  END
+                ), 0)::float as pos_today_sales
+              `)
+            )
+            .first()
+        : Promise.resolve(null),
+
+      // Platform-wide Online Delivery Stats (Admin Only when !storeId - exclude store POS)
+      !storeId
+        ? applyRevenueOrderFilter(db("orders"))
+            .where(function () {
+              this.whereNull("shipping_address").orWhere(function () {
+                this.whereNot("shipping_address", "like", "%In-Store%").andWhereNot("order_number", "like", "POS-%");
+              });
+            })
+            .where(function () {
+              this.whereNull("store_id").orWhere(function () {
+                this.whereNotNull("store_id").where("is_forwarded_to_store", true);
+              });
+            })
+            .select(
+              db.raw("COUNT(id) as online_orders"),
+              db.raw("COALESCE(SUM(total_amount), 0)::float as online_revenue"),
+              db.raw(`
+                COALESCE(SUM(
+                  CASE 
+                    WHEN created_at >= '${todayStart.toISOString()}'
+                    THEN total_amount
+                    ELSE 0
+                  END
+                ), 0)::float as online_today_sales
+              `)
+            )
+            .first()
+        : Promise.resolve(null),
     ]);
 
     const totalRevenue = Number(totalRevenueRow?.revenue || 0);
@@ -301,6 +455,25 @@ const DashboardModel = {
     const codCommission = storeEarningsRow ? Math.round(Number(storeEarningsRow.cod_commission || 0)) : 0;
     const netStorePayout = onlineStorePayable - codCommission;
     const todayStoreEarnings = storeEarningsRow ? Math.round(Number(storeEarningsRow.today_store_net_payable || 0)) : 0;
+
+    const posTotalSales = storeId
+      ? (storeEarningsRow ? Math.round(Number(storeEarningsRow.pos_total_sales || 0)) : 0)
+      : (allPosStatsRow ? Math.round(Number(allPosStatsRow.pos_revenue || 0)) : 0);
+    const posOrdersCount = storeId
+      ? (storeEarningsRow ? Number(storeEarningsRow.pos_orders_count || 0) : 0)
+      : (allPosStatsRow ? Number(allPosStatsRow.pos_orders || 0) : 0);
+    const posTodaySales = storeId
+      ? (storeEarningsRow ? Math.round(Number(storeEarningsRow.pos_today_sales || 0)) : 0)
+      : (allPosStatsRow ? Math.round(Number(allPosStatsRow.pos_today_sales || 0)) : 0);
+    const onlineOrdersSales = storeId
+      ? (storeEarningsRow ? Math.round(Number(storeEarningsRow.online_orders_sales || 0)) : 0)
+      : (allOnlineStatsRow ? Math.round(Number(allOnlineStatsRow.online_revenue || 0)) : 0);
+    const onlineOrdersCount = storeId
+      ? (storeEarningsRow ? Number(storeEarningsRow.online_orders_count || 0) : 0)
+      : (allOnlineStatsRow ? Number(allOnlineStatsRow.online_orders || 0) : 0);
+    const onlineTodaySales = storeId
+      ? (storeEarningsRow ? Math.round(Number(storeEarningsRow.online_today_sales || 0)) : 0)
+      : (allOnlineStatsRow ? Math.round(Number(allOnlineStatsRow.online_today_sales || 0)) : 0);
 
     const mainBakeryRevenue = mainBakeryStatsRow ? Math.round(Number(mainBakeryStatsRow.main_bakery_revenue || 0)) : 0;
     const mainBakeryOrders = mainBakeryStatsRow ? Number(mainBakeryStatsRow.main_bakery_orders || 0) : 0;
@@ -345,6 +518,12 @@ const DashboardModel = {
       codCommission,
       netStorePayout,
       todayStoreEarnings,
+      posTotalSales,
+      posOrdersCount,
+      posTodaySales,
+      onlineOrdersSales,
+      onlineOrdersCount,
+      onlineTodaySales,
       mainBakeryRevenue,
       mainBakeryOrders,
       mainBakeryTodaySales,
@@ -371,7 +550,20 @@ const DashboardModel = {
     const baseOrders = () => {
       let q = db("orders");
       if (storeId) {
-        q = q.where("orders.store_id", storeId).where("orders.is_forwarded_to_store", true);
+        q = q.where("orders.store_id", storeId).where(function () {
+          this.where("orders.is_forwarded_to_store", true)
+            .orWhere("orders.shipping_address", "like", "%In-Store%")
+            .orWhere("orders.order_number", "like", "POS-%");
+        });
+      } else {
+        q = q.where(function () {
+          this.whereNull("orders.store_id").orWhere(function () {
+            this.whereNotNull("orders.store_id")
+              .where("orders.is_forwarded_to_store", true)
+              .whereNot("orders.shipping_address", "like", "%In-Store%")
+              .whereNot("orders.order_number", "like", "POS-%");
+          });
+        });
       }
       return q;
     };
@@ -499,7 +691,20 @@ const DashboardModel = {
   async getOrderStatusDistribution(storeId = null) {
     let query = db("orders");
     if (storeId) {
-      query = query.where("store_id", storeId).where("is_forwarded_to_store", true);
+      query = query.where("store_id", storeId).where(function () {
+        this.where("is_forwarded_to_store", true)
+          .orWhere("shipping_address", "like", "%In-Store%")
+          .orWhere("order_number", "like", "POS-%");
+      });
+    } else {
+      query = query.where(function () {
+        this.whereNull("store_id").orWhere(function () {
+          this.whereNotNull("store_id")
+            .where("is_forwarded_to_store", true)
+            .whereNot("shipping_address", "like", "%In-Store%")
+            .whereNot("order_number", "like", "POS-%");
+        });
+      });
     }
     const rows = await query
       .select("status")
@@ -537,7 +742,20 @@ const DashboardModel = {
       .leftJoin("categories", "products.category_id", "categories.id");
 
     if (storeId) {
-      query.where("orders.store_id", storeId).where("orders.is_forwarded_to_store", true);
+      query.where("orders.store_id", storeId).where(function () {
+        this.where("orders.is_forwarded_to_store", true)
+          .orWhere("orders.shipping_address", "like", "%In-Store%")
+          .orWhere("orders.order_number", "like", "POS-%");
+      });
+    } else {
+      query.where(function () {
+        this.whereNull("orders.store_id").orWhere(function () {
+          this.whereNotNull("orders.store_id")
+            .where("orders.is_forwarded_to_store", true)
+            .whereNot("orders.shipping_address", "like", "%In-Store%")
+            .whereNot("orders.order_number", "like", "POS-%");
+        });
+      });
     }
 
     applyRevenueOrderFilter(query, "orders");
@@ -594,7 +812,20 @@ const DashboardModel = {
       .leftJoin("categories", "products.category_id", "categories.id");
 
     if (storeId) {
-      query.where("orders.store_id", storeId).where("orders.is_forwarded_to_store", true);
+      query.where("orders.store_id", storeId).where(function () {
+        this.where("orders.is_forwarded_to_store", true)
+          .orWhere("orders.shipping_address", "like", "%In-Store%")
+          .orWhere("orders.order_number", "like", "POS-%");
+      });
+    } else {
+      query.where(function () {
+        this.whereNull("orders.store_id").orWhere(function () {
+          this.whereNotNull("orders.store_id")
+            .where("orders.is_forwarded_to_store", true)
+            .whereNot("orders.shipping_address", "like", "%In-Store%")
+            .whereNot("orders.order_number", "like", "POS-%");
+        });
+      });
     }
 
     applyRevenueOrderFilter(query, "orders");
@@ -629,7 +860,20 @@ const DashboardModel = {
   async getRecentOrders(limit = 6, storeId = null) {
     let query = db("orders");
     if (storeId) {
-      query = query.where("store_id", storeId).where("is_forwarded_to_store", true);
+      query = query.where("store_id", storeId).where(function () {
+        this.where("is_forwarded_to_store", true)
+          .orWhere("shipping_address", "like", "%In-Store%")
+          .orWhere("order_number", "like", "POS-%");
+      });
+    } else {
+      query = query.where(function () {
+        this.whereNull("store_id").orWhere(function () {
+          this.whereNotNull("store_id")
+            .where("is_forwarded_to_store", true)
+            .whereNot("shipping_address", "like", "%In-Store%")
+            .whereNot("order_number", "like", "POS-%");
+        });
+      });
     }
 
     const rows = await query
@@ -672,7 +916,14 @@ const DashboardModel = {
       return [];
     }
 
-    let ordersQuery = db("orders");
+    let ordersQuery = db("orders").where(function () {
+      this.whereNull("store_id").orWhere(function () {
+        this.whereNotNull("store_id")
+          .where("is_forwarded_to_store", true)
+          .whereNot("shipping_address", "like", "%In-Store%")
+          .whereNot("order_number", "like", "POS-%");
+      });
+    });
 
     const [recentOrders, recentReviews, recentInquiries] = await Promise.all([
       ordersQuery
