@@ -77,13 +77,16 @@ async function listProducts(req, res) {
     filters.includePos = includePos;
     filters.posOnly = posOnly;
 
-    if (
-      isStorefront ||
-      includePos ||
-      req.query.include_admin === "true" ||
-      req.query.include_admin === true
-    ) {
+    const explicitlyExcludeAdmin =
+      req.query.include_admin === "false" ||
+      req.query.include_admin === false ||
+      req.query.store_only === "true" ||
+      req.query.store_only === true;
+
+    if (!explicitlyExcludeAdmin && (isStorefront || req.query.include_admin === "true" || req.query.include_admin === true)) {
       filters.includeAdmin = true;
+    } else {
+      filters.includeAdmin = false;
     }
 
     if (req.user && req.user.role === "store_owner") {
@@ -94,6 +97,9 @@ async function listProducts(req, res) {
         });
       }
       filters.storeId = storeId;
+      if (req.query.include_admin !== "true" && req.query.include_admin !== true) {
+        filters.includeAdmin = false;
+      }
     } else {
       const adminOnly =
         req.query.admin_only === "true" ||
