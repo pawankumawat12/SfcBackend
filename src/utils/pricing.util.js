@@ -368,7 +368,7 @@ async function calculateCartAndOrderPricing({
   const isFreeDelivery =
     freeDeliveryThreshold > 0 && rawSubtotal >= freeDeliveryThreshold && rawSubtotal > 0;
 
-  const deliveryFee = rawSubtotal === 0 ? 0 : (isFreeDelivery ? 0 : baseDeliveryCharge);
+  const deliveryFee = rawSubtotal === 0 || isOutOfRange ? 0 : (isFreeDelivery ? 0 : baseDeliveryCharge);
   const freeDeliverySavings = isFreeDelivery ? baseDeliveryCharge : 0;
   const freeDeliveryShortfall =
     !isFreeDelivery && freeDeliveryThreshold > 0 && rawSubtotal > 0
@@ -399,8 +399,14 @@ async function calculateCartAndOrderPricing({
   // 7. Fees (Packaging, Platform, COD)
   const packagingFee = rawSubtotal > 0 ? roundCurrency(settings.packaging_fee) : 0;
   const platformFee = rawSubtotal > 0 ? roundCurrency(settings.platform_fee) : 0;
-  const isCod = true;
-  const codFee = rawSubtotal > 0 ? roundCurrency(settings.cod_fee) : 0;
+  
+  // Only charge COD fee if the user explicitly chooses Cash on Delivery
+  const isCod = Boolean(
+    paymentMethod &&
+      (String(paymentMethod).toLowerCase().includes("cash") ||
+        String(paymentMethod).toLowerCase().includes("cod"))
+  );
+  const codFee = (rawSubtotal > 0 && isCod) ? roundCurrency(settings.cod_fee) : 0;
 
   // 8. Grand Total
   let grandTotal = 0;

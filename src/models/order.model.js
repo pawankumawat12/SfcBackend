@@ -126,7 +126,7 @@ async function createOrderWithTransaction({
     // 4. MINIMUM ORDER VALIDATION
     if (pricing.is_below_minimum_order) {
       const err = new Error(
-        `Minimum order amount is ₹${pricing.minimum_order_amount}. Please add items worth ₹${pricing.minimum_order_shortfall} more to proceed.`
+        `Minimum Item Total (Food value) must be ₹${pricing.minimum_order_amount} (excluding taxes & delivery). Current item total is ₹${pricing.subtotal}. Please add items worth ₹${pricing.minimum_order_shortfall} more to proceed.`
       );
 
       err.statusCode = 400;

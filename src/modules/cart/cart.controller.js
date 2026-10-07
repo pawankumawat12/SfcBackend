@@ -198,7 +198,7 @@ async function respondWithCart(res, userId, message = "Success", options = {}) {
   const pricing = await calculateCartAndOrderPricing({
     items,
     deliveryAddress,
-    paymentMethod: options.paymentMethod || "Cash on Delivery",
+    paymentMethod: options.paymentMethod || "Online Payment",
     offerCode: options.offerCode || null,
   });
 
@@ -223,7 +223,7 @@ async function getCart(req, res) {
     const addressId = req.query.addressId ? Number(req.query.addressId) : null;
     const lat = req.query.lat != null ? Number(req.query.lat) : null;
     const lng = req.query.lng != null ? Number(req.query.lng) : null;
-    const paymentMethod = req.query.paymentMethod || "Cash on Delivery";
+    const paymentMethod = req.query.paymentMethod || "Online Payment";
     const offerCode = req.query.offerCode || req.query.code || null;
     return await respondWithCart(
       res,
@@ -495,11 +495,12 @@ async function getGuestCartPreview(req, res) {
         ? { latitude: lat, longitude: lng, formatted_address: "Selected Location" }
         : null;
 
+    const paymentMethod = req.body?.paymentMethod || "Online Payment";
     const formattedItems = formatCartItems(populatedItems);
     const pricing = await calculateCartAndOrderPricing({
       items: formattedItems,
       deliveryAddress: guestDeliveryAddress,
-      paymentMethod: "Cash on Delivery",
+      paymentMethod,
       offerCode,
     });
 
