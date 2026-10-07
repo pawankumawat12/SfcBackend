@@ -1509,6 +1509,7 @@ const getMe = async (req, res) => {
         email: user.email,
         phone: user.phone,
         role: user.role,
+        store_id: user.store_id || req.user?.store_id || null,
         image: user.image,
         token,
         is_active: user.is_active !== false,

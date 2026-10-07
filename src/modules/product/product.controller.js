@@ -68,10 +68,6 @@ async function listProducts(req, res) {
       req.query.include_admin === true ||
       req.query.scope === "storefront";
 
-    if (isStorefront) {
-      filters.includeAdmin = true;
-    }
-
     const includePos =
       req.query.include_pos === "true" ||
       req.query.include_pos === true ||
@@ -81,14 +77,16 @@ async function listProducts(req, res) {
     filters.includePos = includePos;
     filters.posOnly = posOnly;
 
-    const adminOnly =
-      req.query.admin_only === "true" ||
-      req.query.admin_only === true ||
-      req.query.store_id === "admin";
+    if (
+      isStorefront ||
+      includePos ||
+      req.query.include_admin === "true" ||
+      req.query.include_admin === true
+    ) {
+      filters.includeAdmin = true;
+    }
 
-    if (adminOnly) {
-      filters.adminOnly = true;
-    } else if (req.user && req.user.role === "store_owner") {
+    if (req.user && req.user.role === "store_owner") {
       const storeId = parseIdParam(req.user.store_id);
       if (!storeId) {
         return res.status(403).json({
@@ -96,12 +94,21 @@ async function listProducts(req, res) {
         });
       }
       filters.storeId = storeId;
-    } else if (req.query.store_id !== undefined && req.query.store_id !== "admin") {
-      const storeId = parseIdParam(req.query.store_id);
-      if (!storeId) {
-        return res.status(400).json({ message: "Invalid store ID" });
+    } else {
+      const adminOnly =
+        req.query.admin_only === "true" ||
+        req.query.admin_only === true ||
+        req.query.store_id === "admin";
+
+      if (adminOnly) {
+        filters.adminOnly = true;
+      } else if (req.query.store_id !== undefined && req.query.store_id !== "admin") {
+        const storeId = parseIdParam(req.query.store_id);
+        if (!storeId) {
+          return res.status(400).json({ message: "Invalid store ID" });
+        }
+        filters.storeId = storeId;
       }
-      filters.storeId = storeId;
     }
 
     const [products, total, activeOffers, productStats] = await Promise.all([
@@ -206,8 +213,7 @@ async function createProductHandler(req, res) {
         initialImages = [initialImages];
       }
     } else if (isPosOnly) {
-      // Default food/beverage placeholder for instant POS counter product creation
-      initialImages = ["https://images.unsplash.com/photo-1546069901-ba9599a7e63c?w=400&q=80"];
+      initialImages = [];
     }
 
     const { valid, errors, data } = validateProductCreate({
@@ -219,6 +225,7 @@ async function createProductHandler(req, res) {
       images: initialImages,
       categoryId,
       isActive,
+      isPosOnly,
     });
 
     if (!valid) {
@@ -429,13 +436,16 @@ async function updateProductHandler(req, res) {
       }
 
       if (req.user && req.user.role === "store_owner") {
-        const isAllowed = await db("store_categories")
-          .where({ store_id: req.user.store_id, category_id: data.category_id })
-          .first();
-        if (!isAllowed) {
-          return res.status(403).json({
-            message: "You can only assign products to categories assigned to your store.",
-          });
+        const isPosOnly = req.body.is_pos_only === "true" || req.body.is_pos_only === true || existingProduct.is_pos_only;
+        if (!isPosOnly) {
+          const isAllowed = await db("store_categories")
+            .where({ store_id: req.user.store_id, category_id: data.category_id })
+            .first();
+          if (!isAllowed) {
+            return res.status(403).json({
+              message: "You can only assign products to categories assigned to your store.",
+            });
+          }
         }
       }
     }

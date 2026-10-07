@@ -2113,7 +2113,7 @@ async function createPosSaleController(req, res) {
 
 async function getPosSalesHistoryController(req, res) {
   try {
-    const { page = 1, limit = 20, search = "", startDate, endDate } = req.query;
+    const { page = 1, limit = 20, search = "", startDate, endDate, storeId, store_id } = req.query;
     const p = Math.max(1, Number(page) || 1);
     const l = Math.max(1, Math.min(100, Number(limit) || 20));
     const offset = (p - 1) * l;
@@ -2124,6 +2124,29 @@ async function getPosSalesHistoryController(req, res) {
           .orWhere("o.shipping_address", "like", "%POS Counter%")
           .orWhere("o.shipping_address", "like", "%In-Store%");
       });
+
+    // Multi-tenant Store Isolation:
+    if (req.user?.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (userStoreId) {
+        baseQuery = baseQuery.where("o.store_id", userStoreId);
+      } else {
+        return res.status(200).json({
+          success: true,
+          data: [],
+          pagination: { total: 0, page: p, limit: l, totalPages: 1 },
+        });
+      }
+    } else {
+      const requestedStore = storeId !== undefined ? storeId : store_id;
+      if (requestedStore !== undefined && requestedStore !== "" && requestedStore !== "ALL") {
+        if (requestedStore === "null" || requestedStore === "admin") {
+          baseQuery = baseQuery.whereNull("o.store_id");
+        } else {
+          baseQuery = baseQuery.where("o.store_id", Number(requestedStore));
+        }
+      }
+    }
 
     if (search && String(search).trim()) {
       const s = `%${String(search).trim()}%`;
@@ -2208,6 +2231,13 @@ async function updatePosSaleController(req, res) {
       return res.status(404).json({ success: false, message: "POS order not found" });
     }
 
+    if (req.user?.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (Number(existingOrder.store_id) !== Number(userStoreId)) {
+        return res.status(403).json({ success: false, message: "Forbidden: You cannot modify another store's POS sale" });
+      }
+    }
+
     const updatedOrder = await db.transaction(async (trx) => {
       // 1. Fetch current items of this order to reverse their product stock
       const oldItems = await trx("order_items").where({ order_id: orderId });
@@ -2278,6 +2308,7 @@ async function updatePosSaleController(req, res) {
 
         await trx("order_items").insert({
           order_id: orderId,
+          store_id: existingOrder.store_id || null,
           product_id: productId || null,
           product_name: productName,
           price: price,

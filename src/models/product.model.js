@@ -120,8 +120,14 @@ function findProducts({
     // Show only products created by admin (store_id is null)
     query = query.whereNull("products.store_id");
   } else if (storeId !== undefined) {
-    // Show only products belonging to this specific store
-    query = query.where("products.store_id", storeId);
+    if (includeAdmin) {
+      query = query.where(function () {
+        this.where("products.store_id", storeId).orWhereNull("products.store_id");
+      });
+    } else {
+      // Show only products belonging to this specific store
+      query = query.where("products.store_id", storeId);
+    }
   }
 
   if (isActive !== undefined) {
@@ -177,7 +183,13 @@ function countProducts({
   if (adminOnly) {
     query = query.whereNull("products.store_id");
   } else if (storeId !== undefined) {
-    query = query.where({ store_id: storeId });
+    if (includeAdmin) {
+      query = query.where(function () {
+        this.where("products.store_id", storeId).orWhereNull("products.store_id");
+      });
+    } else {
+      query = query.where({ store_id: storeId });
+    }
   }
 
   if (isActive !== undefined) {

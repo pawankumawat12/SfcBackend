@@ -46,6 +46,7 @@ function verifyToken(req, res, next) {
             "phone",
             "image",
             "role",
+            "store_id",
             "is_blocked",
             "is_active",
             "block_reason"

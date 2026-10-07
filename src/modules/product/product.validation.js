@@ -48,8 +48,10 @@ function validateProductCreate({
   availabilityType,
   categoryId,
   isActive,
+  isPosOnly,
 }) {
   const errors = {};
+  const safeImages = Array.isArray(images) ? images : [];
 
   if (!name || typeof name !== "string" || name.trim().length < 2) {
     errors.name = "Name is required and must be at least 2 characters.";
@@ -65,7 +67,7 @@ function validateProductCreate({
     }
   }
 
-  if (!Array.isArray(images) || images.length === 0) {
+  if (!isPosOnly && (!Array.isArray(images) || images.length === 0)) {
     errors.images = "At least one image is required.";
   }
 
@@ -120,7 +122,7 @@ function validateProductCreate({
       price: parsedPrice,
       stock: parsedStock,
       availability_type: normalizedAvailType,
-      images,
+      images: safeImages,
       category_id: parsedCategoryId,
       is_active: parsedIsActive === undefined ? true : parsedIsActive,
     },
