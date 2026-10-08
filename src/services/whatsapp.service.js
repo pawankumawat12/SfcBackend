@@ -1,9 +1,11 @@
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
+  BufferJSON,
+  initAuthCreds,
+  proto,
 } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
 const path = require("path");
@@ -12,14 +14,13 @@ const pino = require("pino");
 const db = require("../../config/db");
 const { emitToAdmin } = require("../socket/socket.service");
 
-const AUTH_DIR = path.join(__dirname, "../../.whatsapp_auth");
-
 let sock = null;
 let currentQrCode = null;
 let connectionStatus = "disconnected"; // "disconnected" | "connecting" | "qr_ready" | "connected"
 let connectedUser = null;
 let reconnectTimer = null;
 let isInitializing = false;
+let currentAuthAdapter = null;
 
 // In-memory cache for message retry decryption and history handling
 const sentMessagesStore = new Map();
@@ -34,13 +35,125 @@ function storeSentMessage(id, message) {
   sentMessagesStore.set(id, message);
 }
 
+const SETTINGS_KEY = "whatsapp_auth_session";
+
 /**
- * Ensure auth folder exists
+ * Custom Settings Table Auth State Adapter for Baileys
+ * Stores credentials and encryption keys directly in the existing `settings` table (key: 'whatsapp_auth_session')
  */
-function ensureAuthDir() {
-  if (!fs.existsSync(AUTH_DIR)) {
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
+async function useSettingsTableAuthState() {
+  const inMemoryData = {
+    creds: null,
+    keys: {},
+  };
+
+  let saveDebounceTimer = null;
+
+  // 1. Load existing session from settings table if available
+  try {
+    const row = await db("settings").where({ key: SETTINGS_KEY }).first();
+    if (row && row.value) {
+      const rawJson = typeof row.value === "string" ? row.value : JSON.stringify(row.value);
+      const parsed = JSON.parse(rawJson, BufferJSON.reviver);
+      if (parsed && parsed.creds) {
+        inMemoryData.creds = parsed.creds;
+        inMemoryData.keys = parsed.keys || {};
+        console.log("[WhatsApp Service] Loaded existing WhatsApp session from settings table.");
+      }
+    }
+  } catch (err) {
+    console.warn("[WhatsApp Service] Notice loading auth from settings:", err.message);
   }
+
+  // If no creds found in settings, initialize fresh
+  if (!inMemoryData.creds) {
+    inMemoryData.creds = initAuthCreds();
+  }
+
+  // Function to persist in-memory data to settings table
+  const persistToDatabase = async () => {
+    try {
+      const serialized = JSON.stringify(inMemoryData, BufferJSON.replacer);
+      const exists = await db("settings").where({ key: SETTINGS_KEY }).first();
+      if (exists) {
+        await db("settings").where({ key: SETTINGS_KEY }).update({
+          value: serialized,
+          updated_at: db.fn.now(),
+        });
+      } else {
+        await db("settings").insert({
+          key: SETTINGS_KEY,
+          value: serialized,
+          created_at: db.fn.now(),
+          updated_at: db.fn.now(),
+        });
+      }
+    } catch (err) {
+      console.error("[WhatsApp Service] Error persisting session to settings table:", err.message);
+    }
+  };
+
+  const scheduleSave = () => {
+    if (saveDebounceTimer) clearTimeout(saveDebounceTimer);
+    saveDebounceTimer = setTimeout(() => {
+      persistToDatabase();
+    }, 500); // 500ms debounce
+  };
+
+  const clearAllAuthData = async () => {
+    try {
+      if (saveDebounceTimer) clearTimeout(saveDebounceTimer);
+      inMemoryData.creds = initAuthCreds();
+      inMemoryData.keys = {};
+      await db("settings").where({ key: SETTINGS_KEY }).delete();
+      console.log("[WhatsApp Service] Cleared WhatsApp session from settings table.");
+    } catch (err) {
+      console.warn("[WhatsApp Service] Notice clearing settings auth:", err.message);
+    }
+  };
+
+  return {
+    state: {
+      creds: inMemoryData.creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          for (const id of ids) {
+            let value = inMemoryData.keys[type]?.[id];
+            if (type === "app-state-sync-key" && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }
+          return data;
+        },
+        set: async (data) => {
+          for (const category in data) {
+            if (!inMemoryData.keys[category]) {
+              inMemoryData.keys[category] = {};
+            }
+            for (const id in data[category]) {
+              const value = data[category][id];
+              if (value) {
+                inMemoryData.keys[category][id] = value;
+              } else {
+                delete inMemoryData.keys[category][id];
+              }
+            }
+          }
+          scheduleSave();
+        },
+      },
+    },
+    saveCreds: () => {
+      scheduleSave();
+    },
+    flushSave: async () => {
+      if (saveDebounceTimer) clearTimeout(saveDebounceTimer);
+      await persistToDatabase();
+    },
+    clearAllAuthData,
+  };
 }
 
 /**
@@ -71,15 +184,17 @@ async function initWhatsAppClient(force = false) {
   }
 
   try {
-    ensureAuthDir();
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    currentAuthAdapter = await useSettingsTableAuthState();
+    const { state, saveCreds } = currentAuthAdapter;
     const { version, isLatest } = await fetchLatestBaileysVersion().catch(() => ({
       version: [2, 3000, 1015901307],
       isLatest: true,
     }));
 
     connectionStatus = "connecting";
-    console.log(`[WhatsApp Service] Connecting with Baileys v${version.join(".")} (Latest: ${isLatest})...`);
+    console.log(
+      `[WhatsApp Service] Connecting with Baileys v${version.join(".")} (Latest: ${isLatest}) using Settings Table Auth...`
+    );
 
     sock = makeWASocket({
       version,
@@ -141,11 +256,9 @@ async function initWhatsAppClient(force = false) {
         });
 
         if (isLoggedOut) {
-          console.log("[WhatsApp Service] Device logged out. Wiping session data...");
-          try {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-          } catch (rmErr) {
-            console.warn("[WhatsApp Service] Warning wiping auth folder:", rmErr.message);
+          console.log("[WhatsApp Service] Device explicitly logged out from mobile phone. Clearing database session...");
+          if (currentAuthAdapter?.clearAllAuthData) {
+            await currentAuthAdapter.clearAllAuthData();
           }
           // Restart to generate a fresh QR
           scheduleReconnect(2000);
@@ -156,7 +269,7 @@ async function initWhatsAppClient(force = false) {
           // Do NOT aggressively reconnect on 440 to avoid infinite ping-pong battle
           scheduleReconnect(30000);
         } else {
-          // Standard network drop or restart: reconnect after 5 seconds
+          // Standard network drop or restart: reconnect using persistent DB keys!
           scheduleReconnect(5000);
         }
       } else if (connection === "open") {
@@ -172,6 +285,11 @@ async function initWhatsAppClient(force = false) {
             sock.user?.id ? sock.user.id.split(":")[0] : "Verified"
           }`
         );
+
+        // Ensure session data is immediately saved to the settings table
+        if (currentAuthAdapter?.flushSave) {
+          await currentAuthAdapter.flushSave();
+        }
 
         emitToAdmin("whatsapp:status", {
           status: "connected",
@@ -227,10 +345,15 @@ async function disconnectWhatsApp() {
     }
   } catch {}
 
+  // Clear persistent DB keys from settings table only on explicit manual disconnect
   try {
-    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    if (currentAuthAdapter?.clearAllAuthData) {
+      await currentAuthAdapter.clearAllAuthData();
+    } else {
+      await db("settings").where({ key: SETTINGS_KEY }).delete();
+    }
   } catch (err) {
-    console.warn("[WhatsApp Service] Error deleting auth folder:", err.message);
+    console.warn("[WhatsApp Service] Error deleting auth from settings table:", err.message);
   }
 
   currentQrCode = null;
