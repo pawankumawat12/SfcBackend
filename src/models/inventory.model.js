@@ -218,6 +218,30 @@ async function getAllIngredients({
   const totalResult = await countQuery;
   const total = Number(totalResult?.total || 0);
 
+  // Compute summary metrics across all records matching current filter (not just the current page)
+  let statsResult = null;
+  try {
+    const statsQuery = query
+      .clone()
+      .clearSelect()
+      .select(
+        db.raw("COUNT(DISTINCT i.id) as total_items"),
+        db.raw(
+          "COUNT(DISTINCT CASE WHEN i.current_stock <= i.min_stock_threshold AND i.current_stock > 0 THEN i.id END) as low_stock_count"
+        ),
+        db.raw(
+          "COUNT(DISTINCT CASE WHEN i.current_stock <= 0 THEN i.id END) as out_of_stock_count"
+        ),
+        db.raw(
+          "COALESCE(SUM(i.current_stock * i.purchase_price), 0) as total_stock_value"
+        )
+      )
+      .first();
+    statsResult = await statsQuery;
+  } catch (err) {
+    console.warn("[Inventory Model] Stats query warning:", err.message);
+  }
+
   const offset = (Math.max(1, Number(page)) - 1) * Number(limit);
   const data = await query
     .orderBy("i.name", "asc")
@@ -239,6 +263,12 @@ async function getAllIngredients({
       page: Number(page),
       limit: Number(limit),
       totalPages: Math.ceil(total / Number(limit)) || 1,
+    },
+    summary: {
+      totalItems: Number(statsResult?.total_items || total),
+      lowStockCount: Number(statsResult?.low_stock_count || 0),
+      outOfStockCount: Number(statsResult?.out_of_stock_count || 0),
+      totalStockValue: Number(statsResult?.total_stock_value || 0),
     },
   };
 }
