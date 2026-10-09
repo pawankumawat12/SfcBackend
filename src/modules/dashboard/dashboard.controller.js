@@ -29,11 +29,11 @@ async function getDashboardOverview(req, res) {
       recentOrders,
       recentActivities,
     ] = await Promise.all([
-      DashboardModel.getKpis(storeId),
+      DashboardModel.getKpis(storeId, timeframe),
       DashboardModel.getRevenueAndOrderTrends(timeframe, storeId),
-      DashboardModel.getOrderStatusDistribution(storeId),
-      DashboardModel.getTopSellingProducts(5, storeId),
-      DashboardModel.getCategorySalesDistribution(storeId),
+      DashboardModel.getOrderStatusDistribution(storeId, timeframe),
+      DashboardModel.getTopSellingProducts(5, storeId, timeframe),
+      DashboardModel.getCategorySalesDistribution(storeId, timeframe),
       DashboardModel.getRecentOrders(6, storeId),
       DashboardModel.getRecentActivities(6, storeId),
     ]);

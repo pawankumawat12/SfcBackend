@@ -46,16 +46,37 @@ function getRevenueSumExpression(tableAlias = "orders", amountCol = "total_amoun
   ), 0)`;
 }
 
+function getTimeframeStartDate(timeframe) {
+  if (!timeframe || timeframe === "all" || timeframe === "all_time") {
+    return null;
+  }
+  const now = new Date();
+  if (timeframe === "daily" || timeframe === "today") {
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+  }
+  if (timeframe === "weekly" || timeframe === "7days") {
+    return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  }
+  if (timeframe === "monthly" || timeframe === "30days") {
+    return new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  }
+  if (timeframe === "yearly" || timeframe === "12months") {
+    return new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+  }
+  return null;
+}
+
 const DashboardModel = {
   /**
    * Get all core KPIs with comparisons
    */
-  async getKpis(storeId = null) {
+  async getKpis(storeId = null, timeframe = null) {
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
     const yesterdayStart = new Date(todayStart);
     yesterdayStart.setDate(yesterdayStart.getDate() - 1);
     const yesterdayEnd = new Date(todayStart);
+    const startDate = getTimeframeStartDate(timeframe);
 
     try {
       await db("orders")
@@ -77,7 +98,7 @@ const DashboardModel = {
         });
     } catch (healErr) {}
 
-    const baseOrders = () => {
+    const baseOrders = (applyTimeframe = false) => {
       let q = db("orders");
       if (storeId) {
         q = q.where("orders.store_id", storeId).where(function () {
@@ -95,6 +116,9 @@ const DashboardModel = {
               .whereNot("orders.order_number", "like", "POS-%");
           });
         });
+      }
+      if (applyTimeframe && startDate) {
+        q = q.where("orders.created_at", ">=", startDate);
       }
       return q;
     };
@@ -119,15 +143,15 @@ const DashboardModel = {
       allOnlineStatsRow,
     ] = await Promise.all([
       // Total orders
-      baseOrders().count("id as count").first(),
+      baseOrders(true).count("id as count").first(),
 
       // Total revenue (strictly realized revenue: paid online or delivered/paid COD)
-      applyRevenueOrderFilter(baseOrders())
+      applyRevenueOrderFilter(baseOrders(true))
         .sum("total_amount as revenue")
         .first(),
 
       // Today sales (strictly realized revenue) & today orders (all non-cancelled placed today)
-      baseOrders()
+      baseOrders(false)
         .where("created_at", ">=", todayStart)
         .whereRaw("LOWER(status) != 'cancelled'")
         .select(
@@ -137,7 +161,7 @@ const DashboardModel = {
         .first(),
 
       // Yesterday sales (strictly realized revenue) & yesterday orders
-      baseOrders()
+      baseOrders(false)
         .where("created_at", ">=", yesterdayStart)
         .where("created_at", "<", yesterdayEnd)
         .whereRaw("LOWER(status) != 'cancelled'")
@@ -148,16 +172,16 @@ const DashboardModel = {
         .first(),
 
       // Pending orders (Preparing, Out for Delivery, Placed, etc.)
-      baseOrders()
+      baseOrders(true)
         .whereRaw("LOWER(status) NOT IN ('delivered', 'cancelled')")
         .count("id as count")
         .first(),
 
       // Delivered orders
-      baseOrders().whereRaw("LOWER(status) = 'delivered'").count("id as count").first(),
+      baseOrders(true).whereRaw("LOWER(status) = 'delivered'").count("id as count").first(),
 
       // Cancelled orders
-      baseOrders().whereRaw("LOWER(status) = 'cancelled'").count("id as count").first(),
+      baseOrders(true).whereRaw("LOWER(status) = 'cancelled'").count("id as count").first(),
 
       // Total customers (users with role 'user' or 'customer') - Admin only (Store owners cannot view customer metrics)
       storeId
@@ -171,7 +195,7 @@ const DashboardModel = {
 
       // Store settlement & earnings (only when storeId is present)
       storeId
-        ? applyRevenueOrderFilter(baseOrders())
+        ? applyRevenueOrderFilter(baseOrders(true))
             .select(
               db.raw(`
                 COALESCE(SUM(
@@ -298,6 +322,9 @@ const DashboardModel = {
               })
               .whereNot("shipping_address", "like", "%In-Store%")
               .whereNot("order_number", "like", "POS-%")
+              .modify((qb) => {
+                if (startDate) qb.where("orders.created_at", ">=", startDate);
+              })
           )
             .select(
               db.raw("COUNT(id) as main_bakery_orders"),
@@ -332,6 +359,9 @@ const DashboardModel = {
               .where("is_forwarded_to_store", true)
               .whereNot("shipping_address", "like", "%In-Store%")
               .whereNot("order_number", "like", "POS-%")
+              .modify((qb) => {
+                if (startDate) qb.where("orders.created_at", ">=", startDate);
+              })
           )
             .select(
               db.raw("COUNT(id) as branch_orders"),
@@ -368,7 +398,11 @@ const DashboardModel = {
 
       // Developer Tech Royalty stats (Platform fee 100% + commission cut) - ONLY for Admin when !storeId
       !storeId
-        ? applyRevenueOrderFilter(db("orders"))
+        ? applyRevenueOrderFilter(
+            db("orders").modify((qb) => {
+              if (startDate) qb.where("orders.created_at", ">=", startDate);
+            })
+          )
             .select(
               db.raw("COALESCE(SUM(platform_fee), 0)::float as total_platform_fee"),
               db.raw(`
@@ -386,11 +420,16 @@ const DashboardModel = {
 
       // Main Bakery POS Counter Stats (Admin Only when !storeId - branch store POS strictly excluded)
       !storeId
-        ? applyRevenueOrderFilter(db("orders"))
-            .whereNull("store_id")
-            .where(function () {
-              this.where("shipping_address", "like", "%In-Store%").orWhere("order_number", "like", "POS-%");
-            })
+        ? applyRevenueOrderFilter(
+            db("orders")
+              .whereNull("store_id")
+              .where(function () {
+                this.where("shipping_address", "like", "%In-Store%").orWhere("order_number", "like", "POS-%");
+              })
+              .modify((qb) => {
+                if (startDate) qb.where("orders.created_at", ">=", startDate);
+              })
+          )
             .select(
               db.raw("COUNT(id) as pos_orders"),
               db.raw("COALESCE(SUM(total_amount), 0)::float as pos_revenue"),
@@ -409,17 +448,22 @@ const DashboardModel = {
 
       // Platform-wide Online Delivery Stats (Admin Only when !storeId - exclude store POS)
       !storeId
-        ? applyRevenueOrderFilter(db("orders"))
-            .where(function () {
-              this.whereNull("shipping_address").orWhere(function () {
-                this.whereNot("shipping_address", "like", "%In-Store%").andWhereNot("order_number", "like", "POS-%");
-              });
-            })
-            .where(function () {
-              this.whereNull("store_id").orWhere(function () {
-                this.whereNotNull("store_id").where("is_forwarded_to_store", true);
-              });
-            })
+        ? applyRevenueOrderFilter(
+            db("orders")
+              .where(function () {
+                this.whereNull("shipping_address").orWhere(function () {
+                  this.whereNot("shipping_address", "like", "%In-Store%").andWhereNot("order_number", "like", "POS-%");
+                });
+              })
+              .where(function () {
+                this.whereNull("store_id").orWhere(function () {
+                  this.whereNotNull("store_id").where("is_forwarded_to_store", true);
+                });
+              })
+              .modify((qb) => {
+                if (startDate) qb.where("orders.created_at", ">=", startDate);
+              })
+          )
             .select(
               db.raw("COUNT(id) as online_orders"),
               db.raw("COALESCE(SUM(total_amount), 0)::float as online_revenue"),
@@ -591,7 +635,7 @@ const DashboardModel = {
           revenue: Number(item?.revenue || 0),
         });
       }
-    } else if (timeframe === "yearly") {
+    } else if (timeframe === "yearly" || timeframe === "all" || timeframe === "all_time") {
       const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
       const oneYearAgo = new Date();
       oneYearAgo.setMonth(oneYearAgo.getMonth() - 11);
@@ -688,7 +732,8 @@ const DashboardModel = {
   /**
    * Get order status breakdown
    */
-  async getOrderStatusDistribution(storeId = null) {
+  async getOrderStatusDistribution(storeId = null, timeframe = null) {
+    const startDate = getTimeframeStartDate(timeframe);
     let query = db("orders");
     if (storeId) {
       query = query.where("store_id", storeId).where(function () {
@@ -705,6 +750,9 @@ const DashboardModel = {
             .whereNot("order_number", "like", "POS-%");
         });
       });
+    }
+    if (startDate) {
+      query = query.where("orders.created_at", ">=", startDate);
     }
     const rows = await query
       .select("status")
@@ -735,7 +783,8 @@ const DashboardModel = {
   /**
    * Top selling products by volume and revenue
    */
-  async getTopSellingProducts(limit = 5, storeId = null) {
+  async getTopSellingProducts(limit = 5, storeId = null, timeframe = null) {
+    const startDate = getTimeframeStartDate(timeframe);
     const query = db("order_items")
       .join("orders", "order_items.order_id", "orders.id")
       .leftJoin("products", "order_items.product_id", "products.id")
@@ -756,6 +805,10 @@ const DashboardModel = {
             .whereNot("orders.order_number", "like", "POS-%");
         });
       });
+    }
+
+    if (startDate) {
+      query.where("orders.created_at", ">=", startDate);
     }
 
     applyRevenueOrderFilter(query, "orders");
@@ -805,7 +858,8 @@ const DashboardModel = {
   /**
    * Category-wise sales distribution
    */
-  async getCategorySalesDistribution(storeId = null) {
+  async getCategorySalesDistribution(storeId = null, timeframe = null) {
+    const startDate = getTimeframeStartDate(timeframe);
     const query = db("order_items")
       .join("orders", "order_items.order_id", "orders.id")
       .leftJoin("products", "order_items.product_id", "products.id")
@@ -826,6 +880,10 @@ const DashboardModel = {
             .whereNot("orders.order_number", "like", "POS-%");
         });
       });
+    }
+
+    if (startDate) {
+      query.where("orders.created_at", ">=", startDate);
     }
 
     applyRevenueOrderFilter(query, "orders");
