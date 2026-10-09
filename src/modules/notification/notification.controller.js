@@ -1,15 +1,24 @@
 const notificationModel = require("../../models/notification.model");
 
+function resolveRole(user) {
+  if (!user) return "customer";
+  if (user.role === "admin") return "admin";
+  if (user.role === "store_owner") return "store_owner";
+  return "customer";
+}
+
 async function listNotifications(req, res) {
   try {
     const user = req.user;
-    const role = user.role === "admin" ? "admin" : "customer";
+    const role = resolveRole(user);
+    const storeId = user.store_id || null;
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 20;
 
     const result = await notificationModel.getNotifications({
       userId: user.id,
       role,
+      storeId,
       page,
       limit,
     });
@@ -17,6 +26,7 @@ async function listNotifications(req, res) {
     const unreadCount = await notificationModel.getUnreadNotificationCount({
       userId: user.id,
       role,
+      storeId,
     });
 
     return res.status(200).json({
@@ -36,11 +46,13 @@ async function listNotifications(req, res) {
 async function getUnreadCount(req, res) {
   try {
     const user = req.user;
-    const role = user.role === "admin" ? "admin" : "customer";
+    const role = resolveRole(user);
+    const storeId = user.store_id || null;
 
     const count = await notificationModel.getUnreadNotificationCount({
       userId: user.id,
       role,
+      storeId,
     });
 
     return res.status(200).json({
@@ -71,11 +83,13 @@ async function markRead(req, res) {
 async function markAllRead(req, res) {
   try {
     const user = req.user;
-    const role = user.role === "admin" ? "admin" : "customer";
+    const role = resolveRole(user);
+    const storeId = user.store_id || null;
 
     await notificationModel.markAllNotificationsAsRead({
       userId: user.id,
       role,
+      storeId,
     });
 
     return res.status(200).json({

@@ -627,13 +627,17 @@ async function sendOrderWhatsAppAlert(order) {
         .first();
 
       const hasDispatchPermission = Boolean(
-        storeDetails?.auto_forward_orders || fullOrder.is_forwarded_to_store
+        storeDetails?.auto_forward_orders ||
+        fullOrder.is_forwarded_to_store ||
+        fullOrder.forwarded_at
       );
 
       if (hasDispatchPermission) {
-        const storePhone = storeDetails.store_phone || storeDetails.owner_phone;
-        if (storePhone) {
-          targetPhones.push(storePhone);
+        if (storeDetails?.store_phone) {
+          targetPhones.push(storeDetails.store_phone);
+        }
+        if (storeDetails?.owner_phone) {
+          targetPhones.push(storeDetails.owner_phone);
         }
       }
     }

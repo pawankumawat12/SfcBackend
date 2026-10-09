@@ -56,6 +56,41 @@ async function notifyPaymentSuccess(order, paymentId, source = "api") {
       });
     }
 
+    // 2b. Store Owner In-App Notification (if order is assigned/auto-forwarded to a store)
+    if (order.store_id) {
+      try {
+        const store = await db("stores").where({ id: order.store_id }).first();
+        if (store && (store.auto_forward_orders || order.is_forwarded_to_store) && store.owner_id) {
+          await notificationModel.createNotification({
+            userId: store.owner_id,
+            role: "store_owner",
+            storeId: store.id,
+            type: "payment_success",
+            title: `Payment Received: #${orderNumber}`,
+            message: `Online payment of ₹${amount} received for order #${orderNumber} assigned to your store.`,
+            orderId: order.id,
+            dataJson: {
+              orderId: order.id,
+              orderNumber: order.order_number,
+              customerName: order.customer_name,
+              totalAmount: order.total_amount,
+              paymentMethod: order.payment_method,
+              paymentStatus: order.payment_status,
+              orderStatus: order.status,
+              razorpayPaymentId: paymentId,
+              source,
+            },
+          });
+          emitToUser(store.owner_id, "new_order", {
+            order,
+            message: `Online paid order #${orderNumber} assigned to your store!`,
+          });
+        }
+      } catch (storePayErr) {
+        console.warn("[OrderPaymentService] Store owner payment notification error:", storePayErr.message);
+      }
+    }
+
     // 3. Socket.IO Admin Events
     emitToAdmin("payment_success", {
       order,

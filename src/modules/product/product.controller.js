@@ -64,8 +64,6 @@ async function listProducts(req, res) {
 
     const isStorefront =
       req.headers["x-client-type"] === "storefront" ||
-      req.query.include_admin === "true" ||
-      req.query.include_admin === true ||
       req.query.scope === "storefront";
 
     const includePos =
@@ -77,19 +75,26 @@ async function listProducts(req, res) {
     filters.includePos = includePos;
     filters.posOnly = posOnly;
 
-    const explicitlyExcludeAdmin =
-      req.query.include_admin === "false" ||
-      req.query.include_admin === false ||
-      req.query.store_only === "true" ||
-      req.query.store_only === true;
-
-    if (!explicitlyExcludeAdmin && (isStorefront || req.query.include_admin === "true" || req.query.include_admin === true)) {
-      filters.includeAdmin = true;
-    } else {
-      filters.includeAdmin = false;
-    }
-
-    if (req.user && req.user.role === "store_owner") {
+    if (isStorefront) {
+      if (req.query.store_id === "admin") {
+        // User is at admin location or no branch store available fallback
+        filters.adminOnly = true;
+        filters.includeAdmin = false;
+      } else if (req.query.store_id !== undefined && req.query.store_id !== "") {
+        const storeId = parseIdParam(req.query.store_id);
+        if (!storeId) {
+          return res.status(400).json({ message: "Invalid store ID" });
+        }
+        filters.storeId = storeId;
+        filters.adminOnly = false;
+        // Strictly show only this branch store's products, never admin or other stores
+        filters.includeAdmin = false;
+      } else {
+        // Fallback for storefront if no store is selected: strictly Main Bakery (admin) products
+        filters.adminOnly = true;
+        filters.includeAdmin = false;
+      }
+    } else if (req.user && req.user.role === "store_owner") {
       const storeId = parseIdParam(req.user.store_id);
       if (!storeId) {
         return res.status(403).json({
@@ -99,6 +104,8 @@ async function listProducts(req, res) {
       filters.storeId = storeId;
       if (req.query.include_admin !== "true" && req.query.include_admin !== true) {
         filters.includeAdmin = false;
+      } else {
+        filters.includeAdmin = true;
       }
     } else {
       const adminOnly =
@@ -108,12 +115,24 @@ async function listProducts(req, res) {
 
       if (adminOnly) {
         filters.adminOnly = true;
-      } else if (req.query.store_id !== undefined && req.query.store_id !== "admin") {
+      } else if (req.query.store_id !== undefined && req.query.store_id !== "") {
         const storeId = parseIdParam(req.query.store_id);
         if (!storeId) {
           return res.status(400).json({ message: "Invalid store ID" });
         }
         filters.storeId = storeId;
+      }
+
+      const explicitlyExcludeAdmin =
+        req.query.include_admin === "false" ||
+        req.query.include_admin === false ||
+        req.query.store_only === "true" ||
+        req.query.store_only === true;
+
+      if (!explicitlyExcludeAdmin && (req.query.include_admin === "true" || req.query.include_admin === true)) {
+        filters.includeAdmin = true;
+      } else {
+        filters.includeAdmin = false;
       }
     }
 

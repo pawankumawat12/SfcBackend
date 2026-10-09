@@ -10,6 +10,7 @@ try {
 async function createNotification({
   userId = null,
   role = "customer",
+  storeId = null,
   type,
   title,
   message,
@@ -20,6 +21,7 @@ async function createNotification({
     .insert({
       user_id: userId ? Number(userId) : null,
       role,
+      store_id: storeId ? Number(storeId) : null,
       type,
       title,
       message,
@@ -41,6 +43,13 @@ async function createNotification({
         getUnreadNotificationCount({ role: "admin" }).then((count) => {
           socketService.emitToAdmin("notification:unread_count", { unreadCount: count });
         });
+      } else if (role === "store_owner") {
+        if (userId) {
+          socketService.emitToUser(userId, "notification:new", created);
+          getUnreadNotificationCount({ userId, role: "store_owner", storeId }).then((count) => {
+            socketService.emitToUser(userId, "notification:unread_count", { unreadCount: count });
+          });
+        }
       } else if (userId) {
         socketService.emitToUser(userId, "notification:new", created);
         getUnreadNotificationCount({ userId, role: "customer" }).then((count) => {
@@ -56,13 +65,22 @@ async function createNotification({
 }
 
 /**
- * Retrieve notifications for a user or for admins
+ * Retrieve notifications for a user, store owner, or for admins
  */
-async function getNotifications({ userId = null, role = "customer", page = 1, limit = 20, offset = null }) {
+async function getNotifications({ userId = null, role = "customer", storeId = null, page = 1, limit = 20, offset = null }) {
   let query = db("notifications");
 
   if (role === "admin") {
     query = query.where({ role: "admin" });
+  } else if (role === "store_owner") {
+    query = query.where(function () {
+      if (userId) {
+        this.where({ role: "store_owner", user_id: Number(userId) });
+      }
+      if (storeId) {
+        this.orWhere({ store_id: Number(storeId) });
+      }
+    });
   } else if (userId) {
     query = query.where({ user_id: Number(userId), role: "customer" });
   } else {
@@ -94,11 +112,20 @@ async function getNotifications({ userId = null, role = "customer", page = 1, li
 /**
  * Get unread notification count
  */
-async function getUnreadNotificationCount({ userId = null, role = "customer" }) {
+async function getUnreadNotificationCount({ userId = null, role = "customer", storeId = null }) {
   let query = db("notifications").where({ is_read: false });
 
   if (role === "admin") {
     query = query.where({ role: "admin" });
+  } else if (role === "store_owner") {
+    query = query.where(function () {
+      if (userId) {
+        this.where({ role: "store_owner", user_id: Number(userId) });
+      }
+      if (storeId) {
+        this.orWhere({ store_id: Number(storeId) });
+      }
+    });
   } else if (userId) {
     query = query.where({ user_id: Number(userId), role: "customer" });
   } else {
@@ -125,6 +152,12 @@ async function markNotificationAsRead(id) {
         getUnreadNotificationCount({ role: "admin" }).then((count) => {
           socketService.emitToAdmin("notification:unread_count", { unreadCount: count });
         });
+      } else if (existing.role === "store_owner") {
+        if (existing.user_id) {
+          getUnreadNotificationCount({ userId: existing.user_id, role: "store_owner", storeId: existing.store_id }).then((count) => {
+            socketService.emitToUser(existing.user_id, "notification:unread_count", { unreadCount: count });
+          });
+        }
       } else if (existing.user_id) {
         getUnreadNotificationCount({ userId: existing.user_id, role: "customer" }).then((count) => {
           socketService.emitToUser(existing.user_id, "notification:unread_count", { unreadCount: count });
@@ -139,11 +172,20 @@ async function markNotificationAsRead(id) {
 /**
  * Mark all notifications as read for a user or admin
  */
-async function markAllNotificationsAsRead({ userId = null, role = "customer" }) {
+async function markAllNotificationsAsRead({ userId = null, role = "customer", storeId = null }) {
   let query = db("notifications").where({ is_read: false });
 
   if (role === "admin") {
     query = query.where({ role: "admin" });
+  } else if (role === "store_owner") {
+    query = query.where(function () {
+      if (userId) {
+        this.where({ role: "store_owner", user_id: Number(userId) });
+      }
+      if (storeId) {
+        this.orWhere({ store_id: Number(storeId) });
+      }
+    });
   } else if (userId) {
     query = query.where({ user_id: Number(userId), role: "customer" });
   }

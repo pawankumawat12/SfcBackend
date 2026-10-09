@@ -357,54 +357,60 @@ async function createOrder(req, res) {
     // 9. ADMIN NOTIFICATION
     await notificationModel.createNotification({
       role: "admin",
-
       type: "order_created",
-
-      title:
-        `New ${paymentMethod} Order: #${order.order_number || order.id
-        }`,
-
-      message:
-        `${finalCustomerName} placed a ${paymentMethod} order worth ₹${order.total_amount}.`,
-
-      orderId:
-        order.id,
-
+      title: `New ${paymentMethod} Order: #${order.order_number || order.id}`,
+      message: `${finalCustomerName} placed a ${paymentMethod} order worth ₹${order.total_amount}.`,
+      orderId: order.id,
       dataJson: {
-        orderId:
-          order.id,
-
-        orderNumber:
-          order.order_number ||
-          `#SFC-${order.id}`,
-
-        customerName:
-          finalCustomerName,
-
-        totalAmount:
-          order.total_amount,
-
+        orderId: order.id,
+        orderNumber: order.order_number || `#SFC-${order.id}`,
+        customerName: finalCustomerName,
+        totalAmount: order.total_amount,
         paymentMethod,
-
-        paymentStatus:
-          order.payment_status,
-
-        orderStatus:
-          order.status,
+        paymentStatus: order.payment_status,
+        orderStatus: order.status,
       },
     });
 
-    // 10. SOCKET.IO ADMIN EVENT
+    // 9b. STORE OWNER NOTIFICATION (if order is assigned/auto-forwarded to a store)
+    if (order.store_id) {
+      try {
+        const store = await db("stores").where({ id: order.store_id }).first();
+        if (store && (store.auto_forward_orders || order.is_forwarded_to_store) && store.owner_id) {
+          await notificationModel.createNotification({
+            userId: store.owner_id,
+            role: "store_owner",
+            storeId: store.id,
+            type: "order_created",
+            title: `New ${paymentMethod} Order: #${order.order_number || order.id}`,
+            message: `${finalCustomerName} placed a ${paymentMethod} order worth ₹${order.total_amount}.`,
+            orderId: order.id,
+            dataJson: {
+              orderId: order.id,
+              orderNumber: order.order_number || `#SFC-${order.id}`,
+              customerName: finalCustomerName,
+              totalAmount: order.total_amount,
+              paymentMethod,
+              paymentStatus: order.payment_status,
+              orderStatus: order.status,
+            },
+          });
+          emitToUser(store.owner_id, "new_order", {
+            order,
+            message: `New order #${order.order_number || order.id} assigned to your store!`,
+          });
+        }
+      } catch (storeNotifErr) {
+        console.warn("[OrderController] Store owner notification error on create:", storeNotifErr.message);
+      }
+    }
 
+    // 10. SOCKET.IO ADMIN EVENT
     emitToAdmin(
       "admin_new_order",
       {
         order,
-
-        message:
-          `New ${paymentMethod} order #${order.order_number ||
-          order.id
-          } from ${finalCustomerName}`,
+        message: `New ${paymentMethod} order #${order.order_number || order.id} from ${finalCustomerName}`,
       }
     );
 
@@ -1096,6 +1102,7 @@ async function forwardOrderToStoreHandler(req, res) {
           await notificationModel.createNotification({
             userId: store.owner_id,
             role: "store_owner",
+            storeId: updated.store_id,
             type: "order_forwarded",
             title: `New Store Order Dispatched! 📦`,
             message: `Order #${updated.order_number || updated.id} has been dispatched to your store.`,
@@ -1104,6 +1111,10 @@ async function forwardOrderToStoreHandler(req, res) {
           });
 
           emitToUser(store.owner_id, "new_store_order", {
+            order: updated,
+            message: `New order #${updated.order_number || updated.id} dispatched to your store!`,
+          });
+          emitToUser(store.owner_id, "new_order", {
             order: updated,
             message: `New order #${updated.order_number || updated.id} dispatched to your store!`,
           });
