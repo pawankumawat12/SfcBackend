@@ -297,7 +297,7 @@ async function createProductHandler(req, res) {
       }
 
       data.store_id = storeId;
-    } else if (req.user && req.user.role === "admin") {
+      } else if (req.user && (req.user.role === "admin" || req.user.role === "manager")) {
       const rawStoreId = bodyStoreId || bodyStoreIdCamel;
       if (rawStoreId && rawStoreId !== "admin" && rawStoreId !== "null" && rawStoreId !== "") {
         const parsedStoreId = Number(rawStoreId);
@@ -324,6 +324,28 @@ async function createProductHandler(req, res) {
         }
       }
     }
+
+    const rawBarcode = req.body?.barcode ?? req.body?.qr_code ?? req.body?.qrCode;
+    const cleanBarcode =
+      rawBarcode !== undefined && rawBarcode !== null && String(rawBarcode).trim() !== ""
+        ? String(rawBarcode).trim()
+        : null;
+
+    if (cleanBarcode) {
+      let dupQuery = db("products").whereRaw("LOWER(barcode) = ?", [cleanBarcode.toLowerCase()]);
+      if (data.store_id) {
+        dupQuery = dupQuery.andWhere({ store_id: data.store_id });
+      } else {
+        dupQuery = dupQuery.whereNull("store_id");
+      }
+      const duplicateProd = await dupQuery.first();
+      if (duplicateProd) {
+        return res.status(400).json({
+          message: `This QR / Barcode (${cleanBarcode}) is already assigned to "${duplicateProd.name}".`,
+        });
+      }
+    }
+    data.barcode = cleanBarcode;
 
     if (req.files && req.files.length > 0) {
       uploadedResults = await Promise.all(
@@ -509,6 +531,36 @@ async function updateProductHandler(req, res) {
       data.is_pos_only = req.body.is_pos_only === "true" || req.body.is_pos_only === true;
     }
 
+    if (
+      req.body.barcode !== undefined ||
+      req.body.qr_code !== undefined ||
+      req.body.qrCode !== undefined
+    ) {
+      const rawBarcode = req.body.barcode ?? req.body.qr_code ?? req.body.qrCode;
+      const cleanBarcode =
+        rawBarcode !== undefined && rawBarcode !== null && String(rawBarcode).trim() !== ""
+          ? String(rawBarcode).trim()
+          : null;
+
+      if (cleanBarcode) {
+        let dupQuery = db("products")
+          .whereRaw("LOWER(barcode) = ?", [cleanBarcode.toLowerCase()])
+          .andWhereNot({ id });
+        if (existingProduct.store_id) {
+          dupQuery = dupQuery.andWhere({ store_id: existingProduct.store_id });
+        } else {
+          dupQuery = dupQuery.whereNull("store_id");
+        }
+        const duplicateProd = await dupQuery.first();
+        if (duplicateProd) {
+          return res.status(400).json({
+            message: `This QR / Barcode (${cleanBarcode}) is already assigned to "${duplicateProd.name}".`,
+          });
+        }
+      }
+      data.barcode = cleanBarcode;
+    }
+
     await updateProduct(id, data);
 
     const product = await findProductById(id);
@@ -532,6 +584,87 @@ async function updateProductHandler(req, res) {
 
     return res.status(500).json({
       message: "Server error",
+    });
+  }
+}
+
+async function adjustProductStockHandler(req, res) {
+  try {
+    const id = parseIdParam(req.params.id);
+    if (!id) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
+
+    const existingProduct = await findProductById(id);
+    if (!existingProduct) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    if (req.user && req.user.role === "store_owner") {
+      const storeId = parseIdParam(req.user.store_id);
+      if (!storeId || Number(existingProduct.store_id) !== storeId) {
+        return res.status(403).json({
+          success: false,
+          message: "You can only adjust stock for products belonging to your store.",
+        });
+      }
+    }
+
+    const mode = String(req.body?.mode || "minus").toLowerCase();
+    const qty = Number(req.body?.quantity);
+    if (!Number.isInteger(qty) || qty <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Quantity must be a positive integer.",
+      });
+    }
+
+    const previousStock = Number(existingProduct.stock || 0);
+    let newStock = previousStock;
+
+    if (mode === "minus" || mode === "deduct") {
+      if (existingProduct.availability_type !== "MADE_TO_ORDER" && previousStock < qty) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot deduct ${qty} units. Only ${previousStock} units available in stock for "${existingProduct.name}".`,
+        });
+      }
+      newStock = Math.max(0, previousStock - qty);
+    } else if (mode === "add" || mode === "plus") {
+      newStock = previousStock + qty;
+    } else if (mode === "set") {
+      newStock = Math.max(0, qty);
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid stock adjustment mode. Use 'minus', 'add', or 'set'.",
+      });
+    }
+
+    await db("products")
+      .where({ id })
+      .update({
+        stock: newStock,
+        updated_at: new Date(),
+      });
+
+    const updatedProduct = await findProductById(id);
+
+    return res.status(200).json({
+      success: true,
+      message:
+        mode === "minus" || mode === "deduct"
+          ? `Stock deducted (-${qty}) for "${existingProduct.name}". Remaining stock: ${newStock}`
+          : `Stock updated (+${qty}) for "${existingProduct.name}". Current stock: ${newStock}`,
+      previousStock,
+      newStock,
+      data: updatedProduct,
+    });
+  } catch (error) {
+    console.error("Adjust product stock error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to adjust product stock",
     });
   }
 }
@@ -724,6 +857,7 @@ module.exports = {
   getProductById,
   createProductHandler,
   updateProductHandler,
+  adjustProductStockHandler,
   deleteProductHandler,
   bulkUpdateProductStatusHandler,
   bulkDeleteProductsHandler,

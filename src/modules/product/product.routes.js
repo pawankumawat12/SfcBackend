@@ -5,6 +5,7 @@ const {
   getProductById,
   createProductHandler,
   updateProductHandler,
+  adjustProductStockHandler,
   deleteProductHandler,
   bulkUpdateProductStatusHandler,
   bulkDeleteProductsHandler,
@@ -24,6 +25,7 @@ router.get("/", optionalToken, listProducts);
 router.get("/:id", optionalToken, getProductById);
 router.post("/", verifyToken, isAdminOrStoreOwner, uploadImage.array("images", 5), createProductHandler);
 router.put("/:id", verifyToken, isAdminOrStoreOwner, uploadImage.array("images", 5), updateProductHandler);
+router.patch("/:id/adjust-stock", verifyToken, isAdminOrStoreOwner, adjustProductStockHandler);
 router.delete("/:id", verifyToken, isAdminOrStoreOwner, deleteProductHandler);
 
 module.exports = router;

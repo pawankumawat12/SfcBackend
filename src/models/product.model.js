@@ -12,6 +12,7 @@ async function ensureProductColumns() {
   try {
     await db.raw(`
       ALTER TABLE products ADD COLUMN IF NOT EXISTS is_pos_only BOOLEAN DEFAULT FALSE;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(255);
     `);
     productSchemaChecked = true;
   } catch (err) {
@@ -31,6 +32,7 @@ const PRODUCT_COLUMNS = [
   "products.store_id",
   "products.is_active",
   "products.is_pos_only",
+  "products.barcode",
   "products.image_keys",
   "products.storage_provider",
   "products.created_at",
@@ -49,6 +51,7 @@ function serializeImages(data) {
 }
 
 async function findProductById(id) {
+  await ensureProductColumns();
   const row = await db("products")
     .select([
       ...PRODUCT_COLUMNS,
@@ -81,7 +84,7 @@ async function findProductById(id) {
 }
 
 
-function findProducts({
+async function findProducts({
   page,
   limit,
   offset,
@@ -97,7 +100,7 @@ function findProducts({
   sortBy = "products.created_at",
   sortOrder = "desc",
 }) {
-  ensureProductColumns().catch(() => {});
+  await ensureProductColumns();
   let query = db("products")
     .select([
       ...PRODUCT_COLUMNS,
@@ -148,10 +151,9 @@ function findProducts({
 
   if (search) {
     query = query.where(function () {
-      this.whereILike("products.name", `%${search}%`).orWhereILike(
-        "products.description",
-        `%${search}%`,
-      );
+      this.whereILike("products.name", `%${search}%`)
+        .orWhereILike("products.description", `%${search}%`)
+        .orWhereILike("products.barcode", `%${search}%`);
     });
   }
 
@@ -162,7 +164,7 @@ function findProducts({
     .offset(offset);
 }
 
-function countProducts({
+async function countProducts({
   categoryId,
   storeId,
   includeAdmin = false,
@@ -173,7 +175,7 @@ function countProducts({
   posOnly = false,
   search,
 }) {
-  ensureProductColumns().catch(() => {});
+  await ensureProductColumns();
   let query = db("products");
 
   if (categoryId !== undefined) {
@@ -210,10 +212,9 @@ function countProducts({
 
   if (search) {
     query = query.where(function () {
-      this.whereILike("name", `%${search}%`).orWhereILike(
-        "description",
-        `%${search}%`,
-      );
+      this.whereILike("name", `%${search}%`)
+        .orWhereILike("description", `%${search}%`)
+        .orWhereILike("barcode", `%${search}%`);
     });
   }
 
@@ -231,8 +232,8 @@ function countProductsByCategory(categoryId) {
     .then((row) => Number(row.count || 0));
 }
 
-function createProduct(data) {
-  ensureProductColumns().catch(() => {});
+async function createProduct(data) {
+  await ensureProductColumns();
   return db("products")
     .insert(serializeImages(data))
     .returning([
@@ -247,14 +248,15 @@ function createProduct(data) {
       "store_id",
       "is_active",
       "is_pos_only",
+      "barcode",
       "created_at",
       "updated_at",
     ])
     .then((rows) => rows[0]);
 }
 
-function updateProduct(id, data) {
-  ensureProductColumns().catch(() => {});
+async function updateProduct(id, data) {
+  await ensureProductColumns();
   return db("products")
     .where({ id })
     .update(serializeImages(data))
@@ -269,6 +271,7 @@ function updateProduct(id, data) {
       "category_id",
       "is_active",
       "is_pos_only",
+      "barcode",
       "created_at",
       "updated_at",
     ])
