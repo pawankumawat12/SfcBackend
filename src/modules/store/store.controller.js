@@ -687,6 +687,7 @@ async function verifySetupToken(req, res) {
       email: request.owner_email,
       ownerName: request.owner_name,
       storeName: request.store_name,
+      role: request.owner_role || "store_owner",
     });
   } catch (error) {
     console.error("Verify setup token error:", error);

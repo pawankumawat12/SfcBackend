@@ -122,8 +122,8 @@ function initSocket(httpServer) {
     // 1. Join user's private room (ONLY for their verified ID)
     socket.join(`user_${user.id}`);
 
-    // 2. Join Admin room for admin and store_owner roles
-    if (user.role === "admin" || user.role === "store_owner") {
+    // 2. Join Admin room strictly for admin & manager roles (store_owner receives events only via their private user_<id> room)
+    if (user.role === "admin" || user.role === "manager") {
       socket.join("admin");
       console.log(`[Socket.IO] ${user.role} socket ${socket.id} joined 'admin' room`);
     }

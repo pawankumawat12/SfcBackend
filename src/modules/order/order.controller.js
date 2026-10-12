@@ -372,8 +372,12 @@ async function createOrder(req, res) {
       },
     });
 
-    // 9b. STORE OWNER NOTIFICATION (if order is assigned/auto-forwarded to a store)
-    if (order.store_id) {
+    const isCod =
+      String(paymentMethod).trim().toLowerCase() === "cash on delivery" ||
+      String(paymentMethod).trim().toLowerCase() === "cod";
+
+    // 9b. STORE OWNER NOTIFICATION (only if COD and order is auto-forwarded to a store; Online orders notify after payment verification)
+    if (isCod && order.store_id) {
       try {
         const store = await db("stores").where({ id: order.store_id }).first();
         if (store && (store.auto_forward_orders || order.is_forwarded_to_store) && store.owner_id) {
@@ -413,10 +417,6 @@ async function createOrder(req, res) {
         message: `New ${paymentMethod} order #${order.order_number || order.id} from ${finalCustomerName}`,
       }
     );
-
-    const isCod =
-      String(paymentMethod).trim().toLowerCase() === "cash on delivery" ||
-      String(paymentMethod).trim().toLowerCase() === "cod";
 
     if (isCod) {
 
@@ -1279,7 +1279,7 @@ async function cancelUserOrder(req, res) {
     });
 
     // If order is dispatched to a store, ensure store owner's personal room receives the live cancellation
-    if (existingOrder.store_id) {
+    if (existingOrder.store_id && existingOrder.is_forwarded_to_store) {
       try {
         const storeRecord = await db("stores").where({ id: existingOrder.store_id }).first();
         if (storeRecord && storeRecord.owner_id) {

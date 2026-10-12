@@ -2,7 +2,7 @@ const notificationModel = require("../../models/notification.model");
 
 function resolveRole(user) {
   if (!user) return "customer";
-  if (user.role === "admin") return "admin";
+  if (user.role === "admin" || user.role === "manager") return "admin";
   if (user.role === "store_owner") return "store_owner";
   return "customer";
 }

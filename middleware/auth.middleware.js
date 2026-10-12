@@ -47,11 +47,28 @@ function verifyToken(req, res, next) {
             "image",
             "role",
             "store_id",
+            "permissions",
             "is_blocked",
             "is_active",
             "block_reason"
           )
           .first();
+
+        if (user) {
+          let parsedPerms = [];
+          if (Array.isArray(user.permissions)) {
+            parsedPerms = user.permissions;
+          } else if (typeof user.permissions === "string") {
+            try {
+              parsedPerms = JSON.parse(user.permissions);
+            } catch {
+              parsedPerms = [];
+            }
+          }
+          user.permissions = parsedPerms;
+          req.user.role = user.role;
+          req.user.permissions = parsedPerms;
+        }
 
         req.currentUser = user;
 
@@ -60,16 +77,21 @@ function verifyToken(req, res, next) {
           (user.is_blocked || user.is_active === false) &&
           user.role !== "admin"
         ) {
-          // Store owners are deactivated when their branch is permanently
-          // deleted. Clear browser cookies and make the client sign out.
-          if (user.role === "store_owner" && user.is_active === false) {
+          // Store owners or managers deactivated/blocked: clear browser cookies and make the client sign out.
+          if (
+            (user.role === "store_owner" || user.role === "manager") &&
+            (user.is_active === false || user.is_blocked)
+          ) {
             const clearOptions = getCookieClearOptions(req);
             res.clearCookie("accessToken", clearOptions);
             res.clearCookie("refreshToken", clearOptions);
             return res.status(401).json({
               success: false,
               sessionRevoked: true,
-              message: "Your store has been deleted. You have been signed out.",
+              message:
+                user.role === "manager"
+                  ? "Your manager account has been deactivated by administrator."
+                  : "Your store has been deleted. You have been signed out.",
             });
           }
 
@@ -98,7 +120,7 @@ function verifyToken(req, res, next) {
   );
 }
 
-// Only admin allowed
+// Allow Admin or Manager
 function isAdmin(req, res, next) {
   if (!req.user) {
     return res.status(401).json({
@@ -106,7 +128,7 @@ function isAdmin(req, res, next) {
     });
   }
 
-  if (req.user.role !== "admin") {
+  if (req.user.role !== "admin" && req.user.role !== "manager") {
     return res.status(403).json({
       message: "Access denied. Admins only.",
     });
@@ -115,7 +137,24 @@ function isAdmin(req, res, next) {
   next();
 }
 
-// Allow Admin or Store Owner
+// Strictly Super Admin only (e.g. managing Managers/Staff)
+function isSuperAdmin(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({
+      message: "Unauthorized",
+    });
+  }
+
+  if (req.user.role !== "admin") {
+    return res.status(403).json({
+      message: "Access denied. Super Administrator only.",
+    });
+  }
+
+  next();
+}
+
+// Allow Admin, Manager, or Store Owner
 function isAdminOrStoreOwner(req, res, next) {
   if (!req.user) {
     return res.status(401).json({
@@ -123,7 +162,11 @@ function isAdminOrStoreOwner(req, res, next) {
     });
   }
 
-  if (req.user.role !== "admin" && req.user.role !== "store_owner") {
+  if (
+    req.user.role !== "admin" &&
+    req.user.role !== "manager" &&
+    req.user.role !== "store_owner"
+  ) {
     return res.status(403).json({
       message: "Access denied. Admins or Store Owners only.",
     });
@@ -173,6 +216,7 @@ async function optionalToken(req, res, next) {
 module.exports = {
   verifyToken,
   isAdmin,
+  isSuperAdmin,
   isAdminOrStoreOwner,
   optionalToken,
 };

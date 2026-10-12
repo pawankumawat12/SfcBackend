@@ -224,14 +224,14 @@ const forgotPassword = async (req, res) => {
     const isAdminSource = requestedRole === "admin" || origin.includes("5173");
 
     if (isAdminSource) {
-      if (user.role !== "admin" && user.role !== "store_owner") {
+      if (user.role !== "admin" && user.role !== "store_owner" && user.role !== "manager") {
         return res.status(403).json({
           message: "Email does not exist",
         });
       }
     } else {
       // Customer frontend source
-      if (user.role === "admin" || user.role === "store_owner") {
+      if (user.role === "admin" || user.role === "store_owner" || user.role === "manager") {
         return res.status(403).json({
           message: "Email does not exist",
         });
@@ -707,6 +707,11 @@ const verifyOtp = async (req, res) => {
         token: accessToken,
         phone: user.phone,
         role: user.role,
+        permissions: Array.isArray(user.permissions)
+          ? user.permissions
+          : typeof user.permissions === "string"
+            ? (() => { try { return JSON.parse(user.permissions); } catch { return []; } })()
+            : [],
         image: user.image,
         is_active: user.is_active !== false,
         is_blocked: Boolean(user.is_blocked),
@@ -1147,11 +1152,11 @@ async function adminLogin(req, res) {
       return res.status(404).json({ message: "Invalid credentials" });
     }
 
-    if (admin.role !== "admin" && admin.role !== "store_owner") {
+    if (admin.role !== "admin" && admin.role !== "store_owner" && admin.role !== "manager") {
       return res.status(404).json({ message: "Invalid credentials" });
     }
 
-    if (admin.role === "store_owner" && !admin.password) {
+    if ((admin.role === "store_owner" || admin.role === "manager") && !admin.password) {
       return res.status(403).json({
         success: false,
         isPasswordNotSet: true,
@@ -1195,6 +1200,11 @@ async function adminLogin(req, res) {
           name: admin.name,
           email: admin.email,
           role: admin.role,
+          permissions: Array.isArray(admin.permissions)
+            ? admin.permissions
+            : typeof admin.permissions === "string"
+              ? (() => { try { return JSON.parse(admin.permissions); } catch { return []; } })()
+              : [],
           image: admin.image,
           is_active: admin.is_active !== false,
         },
@@ -1460,6 +1470,11 @@ const refreshAccessToken = async (req, res) => {
         email: user.email,
         phone: user.phone,
         role: user.role,
+        permissions: Array.isArray(user.permissions)
+          ? user.permissions
+          : typeof user.permissions === "string"
+            ? (() => { try { return JSON.parse(user.permissions); } catch { return []; } })()
+            : [],
         image: user.image,
         token: newAccessToken,
         is_active: user.is_active !== false,
@@ -1486,7 +1501,7 @@ const getMe = async (req, res) => {
       req.headers["x-client-type"] === "storefront" ||
       req.headers["x-client-role"] === "user";
 
-    if (isStorefrontClient && user.role === "admin") {
+    if (isStorefrontClient && (user.role === "admin" || user.role === "manager")) {
       return res.status(403).json({
         success: false,
         message: "Admin accounts cannot be used on the customer storefront. Please use customer credentials.",
@@ -1510,6 +1525,11 @@ const getMe = async (req, res) => {
         phone: user.phone,
         role: user.role,
         store_id: user.store_id || req.user?.store_id || null,
+        permissions: Array.isArray(user.permissions)
+          ? user.permissions
+          : typeof user.permissions === "string"
+            ? (() => { try { return JSON.parse(user.permissions); } catch { return []; } })()
+            : [],
         image: user.image,
         token,
         is_active: user.is_active !== false,

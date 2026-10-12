@@ -77,6 +77,7 @@ async function ensureStoreColumns() {
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      ALTER TABLE store_login_requests ALTER COLUMN store_id DROP NOT NULL;
       ALTER TABLE store_login_requests ADD COLUMN IF NOT EXISTS approved_by INTEGER;
       ALTER TABLE store_login_requests ADD COLUMN IF NOT EXISTS setup_token VARCHAR(255);
       ALTER TABLE store_login_requests ADD COLUMN IF NOT EXISTS setup_token_expires_at TIMESTAMPTZ;
@@ -86,7 +87,27 @@ async function ensureStoreColumns() {
       ALTER TABLE stores ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'::jsonb;
       ALTER TABLE stores ADD COLUMN IF NOT EXISTS auto_forward_orders BOOLEAN DEFAULT FALSE;
 
+      ALTER TABLE users ALTER COLUMN password DROP NOT NULL;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS store_id INTEGER;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'::jsonb;
+
+      DO $$
+      DECLARE
+        r RECORD;
+      BEGIN
+        FOR r IN 
+          SELECT conname 
+          FROM pg_constraint 
+          WHERE conrelid = 'users'::regclass 
+            AND contype = 'c' 
+            AND conname LIKE '%role%'
+        LOOP
+          EXECUTE 'ALTER TABLE users DROP CONSTRAINT IF EXISTS ' || quote_ident(r.conname);
+        END LOOP;
+      END $$;
+
+      ALTER TABLE users ADD CONSTRAINT users_role_check CHECK (role IN ('user', 'admin', 'store_owner', 'manager'));
+
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_id INTEGER;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_forwarded_to_store BOOLEAN DEFAULT FALSE;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS forwarded_at TIMESTAMPTZ;
@@ -748,16 +769,19 @@ async function rejectStoreLoginRequest(requestId, adminId, reason) {
 }
 
 async function findRequestBySetupToken(token) {
+  await ensureStoreColumns();
   if (!token) return null;
   return await db(`${STORE_LOGIN_REQUESTS_TABLE} as slr`)
-    .join(`${STORES_TABLE} as s`, "slr.store_id", "s.id")
+    .leftJoin(`${STORES_TABLE} as s`, "slr.store_id", "s.id")
     .join(`${USERS_TABLE} as u`, "slr.user_id", "u.id")
     .select(
       "slr.*",
-      "s.name as store_name",
+      db.raw("COALESCE(s.name, 'SFC Bakers Admin Portal') as store_name"),
       "u.name as owner_name",
       "u.email as owner_email",
-      "u.id as owner_user_id"
+      "u.id as owner_user_id",
+      "u.role as owner_role",
+      "u.permissions as user_permissions"
     )
     .where("slr.setup_token", token)
     .where("slr.setup_token_expires_at", ">", new Date())
@@ -766,6 +790,7 @@ async function findRequestBySetupToken(token) {
 }
 
 async function completePasswordSetup(userId, requestId, hashedPassword) {
+  await ensureStoreColumns();
   return await db.transaction(async (trx) => {
     // 1. Update user password and activate
     const [user] = await trx(USERS_TABLE)
@@ -776,7 +801,7 @@ async function completePasswordSetup(userId, requestId, hashedPassword) {
         is_email_verified: true,
         updated_at: new Date(),
       })
-      .returning(["id", "name", "email", "role", "store_id", "is_active"]);
+      .returning(["id", "name", "email", "phone", "role", "store_id", "permissions", "is_active"]);
 
     // 2. Clear all setup tokens for this user
     await trx(STORE_LOGIN_REQUESTS_TABLE)
