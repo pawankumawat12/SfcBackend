@@ -22,6 +22,7 @@ async function ensureOrderStoreColumns() {
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS developer_commission_amount NUMERIC DEFAULT 0;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_net_commission_amount NUMERIC DEFAULT 0;
       ALTER TABLE order_items ADD COLUMN IF NOT EXISTS store_id INTEGER;
+      ALTER TABLE order_items ADD COLUMN IF NOT EXISTS cost_price NUMERIC(10,2) DEFAULT 0;
     `);
     orderStoreColumnsChecked = true;
   } catch (err) {
@@ -1369,4 +1370,5 @@ module.exports = {
   rejectOrder,
   forwardOrderToStore,
   getOrderChatStatus,
+  ensureOrderStoreColumns,
 };

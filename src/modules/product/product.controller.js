@@ -353,6 +353,12 @@ async function createProductHandler(req, res) {
         ? String(rawExpiry).trim()
         : null;
 
+    const rawCost = req.body?.cost_price ?? req.body?.costPrice;
+    data.cost_price =
+      rawCost !== undefined && rawCost !== null && !isNaN(Number(rawCost))
+        ? Math.max(0, Number(rawCost))
+        : 0;
+
     if (req.files && req.files.length > 0) {
       uploadedResults = await Promise.all(
         req.files.map((file) => uploadFile(file, { folder: "products" }))
@@ -573,6 +579,14 @@ async function updateProductHandler(req, res) {
         rawExpiry !== undefined && rawExpiry !== null && String(rawExpiry).trim() !== ""
           ? String(rawExpiry).trim()
           : null;
+    }
+
+    if (req.body?.cost_price !== undefined || req.body?.costPrice !== undefined) {
+      const rawCost = req.body.cost_price ?? req.body.costPrice;
+      data.cost_price =
+        rawCost !== undefined && rawCost !== null && !isNaN(Number(rawCost))
+          ? Math.max(0, Number(rawCost))
+          : 0;
     }
 
     await updateProduct(id, data);

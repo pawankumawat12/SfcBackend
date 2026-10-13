@@ -11,6 +11,7 @@ const {
   acceptOrder,
   rejectOrder,
   forwardOrderToStore,
+  ensureOrderStoreColumns,
 } = require("../../models/order.model");
 const Crypto = require("crypto");
 
@@ -2006,6 +2007,7 @@ function generatePosOrderNumber() {
 
 async function createPosSaleController(req, res) {
   try {
+    await ensureOrderStoreColumns();
     const cashierUser = req.user;
     const {
       customerName = "Walk-in Customer",
@@ -2075,12 +2077,24 @@ async function createPosSaleController(req, res) {
           }
         }
 
+        let costPrice = 0;
+        if (productId) {
+          const prodDb = await trx("products")
+            .where({ id: productId })
+            .select("cost_price", "is_pos_only")
+            .first();
+          if (prodDb?.is_pos_only === true) {
+            costPrice = Number(item.cost_price ?? item.costPrice ?? prodDb.cost_price) || 0;
+          }
+        }
+
         // Insert into order_items
         const orderItemRow = {
           order_id: order.id,
           product_id: productId || null,
           product_name: productName,
           price: price,
+          cost_price: costPrice,
           quantity: qty,
           total: roundCurrency(price * qty),
           image: image,
@@ -2133,6 +2147,7 @@ async function createPosSaleController(req, res) {
 
 async function getPosSalesHistoryController(req, res) {
   try {
+    await ensureOrderStoreColumns();
     const { page = 1, limit = 20, search = "", startDate, endDate, storeId, store_id } = req.query;
     const p = Math.max(1, Number(page) || 1);
     const l = Math.max(1, Math.min(100, Number(limit) || 20));
@@ -2185,9 +2200,21 @@ async function getPosSalesHistoryController(req, res) {
       baseQuery = baseQuery.where("o.created_at", "<=", endDate);
     }
 
-    const [countRow, salesRows] = await Promise.all([
+    const [countRow, salesRows, summaryAgg] = await Promise.all([
       baseQuery.clone().count("o.id as count").first(),
       baseQuery.clone().orderBy("o.created_at", "desc").limit(l).offset(offset),
+      baseQuery
+        .clone()
+        .join("order_items as oi", "o.id", "oi.order_id")
+        .join("products as p", "oi.product_id", "p.id")
+        .where("p.is_pos_only", true)
+        .select(
+          db.raw("COALESCE(SUM(oi.total), 0) as total_pos_sales"),
+          db.raw("COALESCE(SUM(COALESCE(oi.cost_price, 0) * oi.quantity), 0) as total_pos_cost"),
+          db.raw("COUNT(DISTINCT o.id) as total_pos_orders"),
+          db.raw("COALESCE(SUM(oi.quantity), 0) as total_pos_items")
+        )
+        .first(),
     ]);
 
     const total = Number(countRow?.count || 0);
@@ -2195,21 +2222,60 @@ async function getPosSalesHistoryController(req, res) {
 
     let itemsByOrder = {};
     if (orderIds.length > 0) {
-      const items = await db("order_items").whereIn("order_id", orderIds).orderBy("id", "asc");
+      const items = await db("order_items as oi")
+        .leftJoin("products as p", "oi.product_id", "p.id")
+        .whereIn("oi.order_id", orderIds)
+        .select("oi.*", "p.is_pos_only")
+        .orderBy("oi.id", "asc");
       items.forEach((item) => {
         if (!itemsByOrder[item.order_id]) itemsByOrder[item.order_id] = [];
         itemsByOrder[item.order_id].push(item);
       });
     }
 
-    const sales = salesRows.map((o) => ({
-      ...o,
-      items: itemsByOrder[o.id] || [],
-    }));
+    const sales = salesRows.map((o) => {
+      const orderItems = itemsByOrder[o.id] || [];
+      const posItems = orderItems.filter((it) => it.is_pos_only === true);
+      const hasPosItems = posItems.length > 0;
+
+      const posSalesRevenue = posItems.reduce(
+        (sum, it) => sum + Number(it.total != null ? it.total : Number(it.price || 0) * Number(it.quantity || 1)),
+        0
+      );
+      const posCost = posItems.reduce(
+        (sum, it) => sum + Number(it.cost_price || 0) * (Number(it.quantity) || 1),
+        0
+      );
+      const posProfit = hasPosItems ? Math.max(0, posSalesRevenue - posCost) : null;
+      const posMargin = hasPosItems && posSalesRevenue > 0 ? (posProfit / posSalesRevenue) * 100 : 0;
+
+      return {
+        ...o,
+        has_pos_items: hasPosItems,
+        total_pos_sales: roundCurrency(posSalesRevenue),
+        total_cost: roundCurrency(posCost),
+        total_profit: posProfit != null ? roundCurrency(posProfit) : null,
+        profit_margin: posProfit != null ? Number(posMargin.toFixed(1)) : null,
+        items: orderItems,
+      };
+    });
+
+    const totalPosSales = Number(summaryAgg?.total_pos_sales || 0);
+    const totalPosCost = Number(summaryAgg?.total_pos_cost || 0);
+    const totalProfit = Math.max(0, totalPosSales - totalPosCost);
+    const profitMargin = totalPosSales > 0 ? (totalProfit / totalPosSales) * 100 : 0;
 
     return res.status(200).json({
       success: true,
       data: sales,
+      summary: {
+        totalSales: roundCurrency(totalPosSales),
+        totalCost: roundCurrency(totalPosCost),
+        totalProfit: roundCurrency(totalProfit),
+        profitMargin: Number(profitMargin.toFixed(1)),
+        totalOrders: Number(summaryAgg?.total_pos_orders || 0),
+        totalItems: Number(summaryAgg?.total_pos_items || 0),
+      },
       pagination: {
         total,
         page: p,
@@ -2225,6 +2291,7 @@ async function getPosSalesHistoryController(req, res) {
 
 async function updatePosSaleController(req, res) {
   try {
+    await ensureOrderStoreColumns();
     const orderId = Number(req.params.id);
     if (!orderId) {
       return res.status(400).json({ success: false, message: "Invalid order ID" });
@@ -2330,12 +2397,24 @@ async function updatePosSaleController(req, res) {
           }
         }
 
+        let costPrice = 0;
+        if (productId) {
+          const prodDb = await trx("products")
+            .where({ id: productId })
+            .select("cost_price", "is_pos_only")
+            .first();
+          if (prodDb?.is_pos_only === true) {
+            costPrice = Number(item.cost_price ?? item.costPrice ?? prodDb.cost_price) || 0;
+          }
+        }
+
         await trx("order_items").insert({
           order_id: orderId,
           store_id: existingOrder.store_id || null,
           product_id: productId || null,
           product_name: productName,
           price: price,
+          cost_price: costPrice,
           quantity: qty,
           total: roundCurrency(price * qty),
           image: image,

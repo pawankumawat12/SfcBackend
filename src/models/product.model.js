@@ -14,6 +14,7 @@ async function ensureProductColumns() {
       ALTER TABLE products ADD COLUMN IF NOT EXISTS is_pos_only BOOLEAN DEFAULT FALSE;
       ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(255);
       ALTER TABLE products ADD COLUMN IF NOT EXISTS expiry_date DATE;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_price NUMERIC(10,2) DEFAULT 0;
     `);
     productSchemaChecked = true;
   } catch (err) {
@@ -26,6 +27,7 @@ const PRODUCT_COLUMNS = [
   "products.name",
   "products.description",
   "products.price",
+  "products.cost_price",
   "products.stock",
   "products.availability_type",
   "products.images",
@@ -243,6 +245,7 @@ async function createProduct(data) {
       "name",
       "description",
       "price",
+      "cost_price",
       "stock",
       "availability_type",
       "images",
@@ -268,6 +271,7 @@ async function updateProduct(id, data) {
       "name",
       "description",
       "price",
+      "cost_price",
       "stock",
       "availability_type",
       "images",
