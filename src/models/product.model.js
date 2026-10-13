@@ -13,6 +13,7 @@ async function ensureProductColumns() {
     await db.raw(`
       ALTER TABLE products ADD COLUMN IF NOT EXISTS is_pos_only BOOLEAN DEFAULT FALSE;
       ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(255);
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS expiry_date DATE;
     `);
     productSchemaChecked = true;
   } catch (err) {
@@ -33,6 +34,7 @@ const PRODUCT_COLUMNS = [
   "products.is_active",
   "products.is_pos_only",
   "products.barcode",
+  "products.expiry_date",
   "products.image_keys",
   "products.storage_provider",
   "products.created_at",
@@ -249,6 +251,7 @@ async function createProduct(data) {
       "is_active",
       "is_pos_only",
       "barcode",
+      "expiry_date",
       "created_at",
       "updated_at",
     ])
@@ -272,6 +275,7 @@ async function updateProduct(id, data) {
       "is_active",
       "is_pos_only",
       "barcode",
+      "expiry_date",
       "created_at",
       "updated_at",
     ])

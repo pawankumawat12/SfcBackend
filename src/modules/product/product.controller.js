@@ -347,6 +347,12 @@ async function createProductHandler(req, res) {
     }
     data.barcode = cleanBarcode;
 
+    const rawExpiry = req.body?.expiry_date ?? req.body?.expiryDate;
+    data.expiry_date =
+      rawExpiry !== undefined && rawExpiry !== null && String(rawExpiry).trim() !== ""
+        ? String(rawExpiry).trim()
+        : null;
+
     if (req.files && req.files.length > 0) {
       uploadedResults = await Promise.all(
         req.files.map((file) => uploadFile(file, { folder: "products" }))
@@ -559,6 +565,14 @@ async function updateProductHandler(req, res) {
         }
       }
       data.barcode = cleanBarcode;
+    }
+
+    if (req.body.expiry_date !== undefined || req.body.expiryDate !== undefined) {
+      const rawExpiry = req.body.expiry_date ?? req.body.expiryDate;
+      data.expiry_date =
+        rawExpiry !== undefined && rawExpiry !== null && String(rawExpiry).trim() !== ""
+          ? String(rawExpiry).trim()
+          : null;
     }
 
     await updateProduct(id, data);
