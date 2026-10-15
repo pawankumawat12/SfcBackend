@@ -66,6 +66,9 @@ function verifyToken(req, res, next) {
             }
           }
           user.permissions = parsedPerms;
+          req.user.name = user.name;
+          req.user.email = user.email;
+          req.user.phone = user.phone;
           req.user.role = user.role;
           req.user.permissions = parsedPerms;
         }

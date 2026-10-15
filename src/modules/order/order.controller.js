@@ -2008,7 +2008,29 @@ function generatePosOrderNumber() {
 async function createPosSaleController(req, res) {
   try {
     await ensureOrderStoreColumns();
-    const cashierUser = req.user;
+    const cashierUser = req.currentUser || req.user || {};
+    let cashierName =
+      req.body?.cashierName ||
+      cashierUser.name ||
+      cashierUser.email ||
+      req.user?.name ||
+      req.user?.email;
+
+    if (!cashierName || cashierName === "undefined") {
+      if (cashierUser.id) {
+        const dbUser = await db("users")
+          .where({ id: cashierUser.id })
+          .select("name", "email", "role")
+          .first();
+        cashierName =
+          dbUser?.name ||
+          dbUser?.email ||
+          (dbUser?.role === "manager" ? "Manager" : "Admin");
+      } else {
+        cashierName = cashierUser.role === "manager" ? "Manager" : "Admin";
+      }
+    }
+
     const {
       customerName = "Walk-in Customer",
       customerPhone = "",
@@ -2054,7 +2076,7 @@ async function createPosSaleController(req, res) {
           status: "Delivered",
           payment_status: "Paid",
           payment_method: paymentMethod || "Cash",
-          notes: notes || `POS Sale (Cashier: ${cashierUser.name || cashierUser.email}, Received: ₹${receivedAmount || totalAmount}, Change: ₹${changeAmount || 0})`,
+          notes: notes || `POS Sale (Cashier: ${cashierName}, Received: ₹${receivedAmount || totalAmount}, Change: ₹${changeAmount || 0})`,
           created_at: trx.fn.now(),
           updated_at: trx.fn.now(),
         })
