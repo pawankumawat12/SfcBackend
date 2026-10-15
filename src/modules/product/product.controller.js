@@ -225,6 +225,14 @@ async function createProductHandler(req, res) {
 
     const isPosOnly = req.body?.is_pos_only === "true" || req.body?.is_pos_only === true;
 
+    // Disallow managers from creating POS items
+    if (req.user && req.user.role === "manager" && isPosOnly) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. Managers are not authorized to create POS items.",
+      });
+    }
+
     let initialImages = [];
     if (req.files && req.files.length > 0) {
       initialImages = req.files;
@@ -423,6 +431,17 @@ async function updateProductHandler(req, res) {
           message: "You can only edit products belonging to your store.",
         });
       }
+    }
+
+    if (
+      req.user &&
+      req.user.role === "manager" &&
+      (existingProduct.is_pos_only || req.body?.is_pos_only === true || req.body?.is_pos_only === "true")
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. Managers are not authorized to modify POS items.",
+      });
     }
 
     const {
@@ -716,6 +735,13 @@ async function deleteProductHandler(req, res) {
           message: "You can only delete products belonging to your store.",
         });
       }
+    }
+
+    if (req.user && req.user.role === "manager" && (existingProduct.is_pos_only || existingProduct.isPosOnly)) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. Managers are not authorized to delete POS items.",
+      });
     }
 
     // Automatically remove product images from Cloudinary to prevent orphaned files
