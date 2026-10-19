@@ -2170,9 +2170,19 @@ async function createPosSaleController(req, res) {
 async function getPosSalesHistoryController(req, res) {
   try {
     await ensureOrderStoreColumns();
-    const { page = 1, limit = 20, search = "", startDate, endDate, storeId, store_id } = req.query;
+    const {
+      page = 1,
+      limit = 20,
+      search = "",
+      startDate,
+      endDate,
+      storeId,
+      store_id,
+      timeRange = "total",
+      period,
+    } = req.query;
     const p = Math.max(1, Number(page) || 1);
-    const l = Math.max(1, Math.min(100, Number(limit) || 20));
+    const l = Math.max(1, Math.min(500, Number(limit) || 50));
     const offset = (p - 1) * l;
 
     let baseQuery = db("orders as o")
@@ -2215,14 +2225,38 @@ async function getPosSalesHistoryController(req, res) {
       });
     }
 
-    if (startDate) {
-      baseQuery = baseQuery.where("o.created_at", ">=", startDate);
-    }
-    if (endDate) {
-      baseQuery = baseQuery.where("o.created_at", "<=", endDate);
+    // Time Range / Period Filtering (day, week, month, year, total)
+    const filterPeriod = String(timeRange || period || "total").toLowerCase();
+    const now = new Date();
+
+    if (filterPeriod === "day" || filterPeriod === "today") {
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfDay);
+    } else if (filterPeriod === "week" || filterPeriod === "this_week") {
+      const startOfWeek = new Date(now);
+      const day = startOfWeek.getDay();
+      const diff = startOfWeek.getDate() - (day === 0 ? 6 : day - 1); // Monday as start of week
+      startOfWeek.setDate(diff);
+      startOfWeek.setHours(0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfWeek);
+    } else if (filterPeriod === "month" || filterPeriod === "this_month") {
+      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfMonth);
+    } else if (filterPeriod === "year" || filterPeriod === "this_year") {
+      const startOfYear = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfYear);
+    } else if (filterPeriod === "total" || filterPeriod === "all") {
+      // Total / All time: no date boundary
+    } else if (startDate || endDate) {
+      if (startDate) {
+        baseQuery = baseQuery.where("o.created_at", ">=", startDate);
+      }
+      if (endDate) {
+        baseQuery = baseQuery.where("o.created_at", "<=", endDate);
+      }
     }
 
-    const [countRow, salesRows, summaryAgg] = await Promise.all([
+    const [countRow, salesRows, summaryAgg, revenueAgg] = await Promise.all([
       baseQuery.clone().count("o.id as count").first(),
       baseQuery.clone().orderBy("o.created_at", "desc").limit(l).offset(offset),
       baseQuery
@@ -2235,6 +2269,13 @@ async function getPosSalesHistoryController(req, res) {
           db.raw("COALESCE(SUM(COALESCE(oi.cost_price, 0) * oi.quantity), 0) as total_pos_cost"),
           db.raw("COUNT(DISTINCT o.id) as total_pos_orders"),
           db.raw("COALESCE(SUM(oi.quantity), 0) as total_pos_items")
+        )
+        .first(),
+      baseQuery
+        .clone()
+        .select(
+          db.raw("COALESCE(SUM(o.total_amount), 0) as total_revenue"),
+          db.raw("COALESCE(SUM(o.discount), 0) as total_discount")
         )
         .first(),
     ]);
@@ -2291,12 +2332,16 @@ async function getPosSalesHistoryController(req, res) {
       success: true,
       data: sales,
       summary: {
+        totalRevenue: roundCurrency(Number(revenueAgg?.total_revenue || 0)),
+        totalDiscount: roundCurrency(Number(revenueAgg?.total_discount || 0)),
         totalSales: roundCurrency(totalPosSales),
         totalCost: roundCurrency(totalPosCost),
         totalProfit: roundCurrency(totalProfit),
         profitMargin: Number(profitMargin.toFixed(1)),
-        totalOrders: Number(summaryAgg?.total_pos_orders || 0),
+        totalOrders: total,
+        totalPosOrders: Number(summaryAgg?.total_pos_orders || 0),
         totalItems: Number(summaryAgg?.total_pos_items || 0),
+        period: filterPeriod,
       },
       pagination: {
         total,
