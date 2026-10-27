@@ -14,7 +14,7 @@ async function handleRazorpayWebhook(req, res) {
   const rawBody = req.rawBody || (typeof req.body === "string" ? req.body : JSON.stringify(req.body));
 
   // 1. VERIFY SIGNATURE
-  const isValid = verifyWebhookSignature(rawBody, signature);
+  const isValid = await verifyWebhookSignature(rawBody, signature);
 
   if (!isValid) {
     console.warn("[Razorpay Webhook] Invalid signature rejected from IP:", req.ip);

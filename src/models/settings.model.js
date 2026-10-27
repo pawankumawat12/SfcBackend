@@ -309,6 +309,70 @@ async function updateStoreStatusSettings(data) {
   return next;
 }
 
+const DEFAULT_PAYMENT_SETTINGS = {
+  key_id: process.env.RAZORPAY_KEY_ID || "",
+  key_secret: process.env.RAZORPAY_KEY_SECRET || "",
+  webhook_secret: process.env.RAZORPAY_WEBHOOK_SECRET || process.env.RAZORPAY_KEY_SECRET || "",
+  is_enabled: true,
+};
+
+async function getPaymentSettings() {
+  const row = await getSetting("payment_settings");
+  const envKeyId = process.env.RAZORPAY_KEY_ID || "";
+  const envKeySecret = process.env.RAZORPAY_KEY_SECRET || "";
+  const envWebhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || envKeySecret || "";
+
+  if (!row) {
+    return {
+      key_id: envKeyId,
+      key_secret: envKeySecret,
+      webhook_secret: envWebhookSecret,
+      is_enabled: true,
+      source: "environment",
+    };
+  }
+
+  const key_id = row.key_id && String(row.key_id).trim() ? String(row.key_id).trim() : envKeyId;
+  const key_secret = row.key_secret && String(row.key_secret).trim() ? String(row.key_secret).trim() : envKeySecret;
+  const webhook_secret = row.webhook_secret && String(row.webhook_secret).trim() ? String(row.webhook_secret).trim() : (envWebhookSecret || key_secret);
+  const is_enabled = row.is_enabled !== undefined ? Boolean(row.is_enabled) : true;
+  const is_db_configured = Boolean(row.key_id && String(row.key_id).trim());
+
+  return {
+    key_id,
+    key_secret,
+    webhook_secret,
+    is_enabled,
+    source: is_db_configured ? "database" : "environment",
+  };
+}
+
+async function updatePaymentSettings(data) {
+  const current = await getPaymentSettings();
+
+  let newKeySecret = current.key_secret;
+  if (data.key_secret && typeof data.key_secret === "string" && !data.key_secret.includes("•")) {
+    newKeySecret = data.key_secret.trim();
+  }
+
+  let newWebhookSecret = current.webhook_secret;
+  if (data.webhook_secret !== undefined && typeof data.webhook_secret === "string") {
+    if (!data.webhook_secret.includes("•")) {
+      newWebhookSecret = data.webhook_secret.trim();
+    }
+  }
+
+  const next = {
+    key_id: data.key_id !== undefined ? String(data.key_id).trim() : current.key_id,
+    key_secret: newKeySecret,
+    webhook_secret: newWebhookSecret,
+    is_enabled: data.is_enabled !== undefined ? Boolean(data.is_enabled) : current.is_enabled,
+  };
+
+  await setSetting("payment_settings", next);
+  return next;
+}
+
 module.exports = {
   DEFAULT_COLOR_THEMES,
   getSetting,
@@ -329,4 +393,7 @@ module.exports = {
   DEFAULT_STORE_STATUS,
   getStoreStatusSettings,
   updateStoreStatusSettings,
+  DEFAULT_PAYMENT_SETTINGS,
+  getPaymentSettings,
+  updatePaymentSettings,
 };

@@ -19,6 +19,8 @@ const {
   testResend,
   getStoreStatus,
   updateStoreStatus,
+  getPayment,
+  updatePayment,
 } = require("./settings.controller");
 
 const router = express.Router();
@@ -43,6 +45,11 @@ router.get("/email", verifyToken, isAdmin, getResend);
 router.put("/email", verifyToken, isAdmin, updateResend);
 router.post("/email/send-otp", verifyToken, isAdmin, sendResendUpdateOtp);
 router.post("/email/test", verifyToken, isAdmin, testResend);
+
+
+// Payment Gateway Settings (Razorpay)
+router.get("/payment", verifyToken, isAdmin, getPayment);
+router.put("/payment", verifyToken, isAdmin, updatePayment);
 
 // Backwards-compatible SMTP aliases
 router.get("/smtp", verifyToken, isAdmin, getSmtp);

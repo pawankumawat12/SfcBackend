@@ -20,7 +20,12 @@ const {
   emitToUser,
   emitToOrder,
 } = require("../../socket/socket.service");
-const { createRazorpayOrder, initiateRazorpayRefund } = require("../../services/razorpayService");
+const {
+  createRazorpayOrder,
+  initiateRazorpayRefund,
+  getRazorpayConfig,
+  verifyPaymentSignature,
+} = require("../../services/razorpayService");
 const { finalizePaidOrder, handleRefundProcessed } = require("../../services/orderPayment.service");
 const db = require("../../../config/db");
 const { incrementOfferUsage } = require("../../models/offer.model");
@@ -271,6 +276,13 @@ async function createOrder(req, res) {
       paymentMethod ===
       "Online Payment"
     ) {
+      const rzpConfig = await getRazorpayConfig();
+      if (!rzpConfig.is_enabled) {
+        return res.status(400).json({
+          success: false,
+          message: "Online payment is currently disabled. Please select Cash on Delivery.",
+        });
+      }
       try {
         razorpayOrder =
           await createRazorpayOrder({
@@ -453,8 +465,7 @@ async function createOrder(req, res) {
         razorpayKeyId:
           paymentMethod ===
             "Online Payment"
-            ? process.env
-              .RAZORPAY_KEY_ID
+            ? (await getRazorpayConfig()).key_id
             : null,
 
         paymentAmount:
@@ -566,19 +577,13 @@ async function verifyRazorpayPayment(req, res) {
     }
 
     // 6. VERIFY RAZORPAY SIGNATURE
-    const generatedSignature = Crypto.createHmac(
-      "sha256",
-      process.env.RAZORPAY_KEY_SECRET
-    )
-      .update(
-        `${razorpay_order_id}|${razorpay_payment_id}`
-      )
-      .digest("hex");
+    const isSignatureValid = await verifyPaymentSignature({
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature,
+    });
 
-    if (
-      generatedSignature !==
-      razorpay_signature
-    ) {
+    if (!isSignatureValid) {
       console.error(
         "Invalid Razorpay signature",
         {
@@ -1427,7 +1432,7 @@ async function retryPaymentController(req, res) {
         orderId: order.id,
         orderNumber: order.order_number,
         razorpayOrderId: razorpayOrder.id,
-        razorpayKeyId: process.env.RAZORPAY_KEY_ID,
+        razorpayKeyId: (await getRazorpayConfig()).key_id,
         amount: roundCurrency(order.total_amount),
         currency: "INR",
         customerName: order.customer_name,

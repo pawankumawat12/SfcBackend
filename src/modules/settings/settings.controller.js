@@ -14,6 +14,8 @@ const {
   updateResendSettings,
   getStoreStatusSettings,
   updateStoreStatusSettings,
+  getPaymentSettings,
+  updatePaymentSettings,
 } = require("../../models/settings.model");
 const { testResendConnection, sendMail } = require("../../services/resend.service");
 const {
@@ -82,6 +84,98 @@ async function updateTheme(req, res) {
     return res.status(500).json({
       success: false,
       message: "Failed to update theme settings",
+    });
+  }
+}
+
+
+function maskPaymentSecret(secret) {
+  if (!secret || typeof secret !== "string") return "";
+  const trimmed = secret.trim();
+  if (trimmed.length <= 8) return "••••••••";
+  return `${trimmed.slice(0, 4)}••••••••${trimmed.slice(-4)}`;
+}
+
+async function getPayment(req, res) {
+  try {
+    const settings = await getPaymentSettings();
+    return res.status(200).json({
+      success: true,
+      message: "Payment settings fetched successfully",
+      data: {
+        key_id: settings.key_id || "",
+        key_secret: maskPaymentSecret(settings.key_secret),
+        webhook_secret: maskPaymentSecret(settings.webhook_secret),
+        is_key_secret_set: Boolean(settings.key_secret),
+        is_webhook_secret_set: Boolean(settings.webhook_secret),
+        is_enabled: settings.is_enabled,
+        source: settings.source,
+      },
+    });
+  } catch (error) {
+    console.error("Get payment settings error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch payment settings",
+    });
+  }
+}
+
+async function updatePayment(req, res) {
+  try {
+    const { key_id, key_secret, webhook_secret, is_enabled, reset_to_env } = req.body;
+
+    if (reset_to_env) {
+      const db = require("../../../config/db");
+      await db("settings").where({ key: "payment_settings" }).del();
+      const reset = await getPaymentSettings();
+      return res.status(200).json({
+        success: true,
+        message: "Payment settings reset to environment defaults",
+        data: {
+          key_id: reset.key_id,
+          key_secret: maskPaymentSecret(reset.key_secret),
+          webhook_secret: maskPaymentSecret(reset.webhook_secret),
+          is_key_secret_set: Boolean(reset.key_secret),
+          is_webhook_secret_set: Boolean(reset.webhook_secret),
+          is_enabled: reset.is_enabled,
+          source: reset.source,
+        },
+      });
+    }
+
+    if (key_id && !key_id.startsWith("rzp_test_") && !key_id.startsWith("rzp_live_")) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Razorpay Key ID. Key ID usually starts with 'rzp_test_' or 'rzp_live_'",
+      });
+    }
+
+    const updated = await updatePaymentSettings({
+      key_id,
+      key_secret,
+      webhook_secret,
+      is_enabled,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Payment settings updated successfully",
+      data: {
+        key_id: updated.key_id,
+        key_secret: maskPaymentSecret(updated.key_secret),
+        webhook_secret: maskPaymentSecret(updated.webhook_secret),
+        is_key_secret_set: Boolean(updated.key_secret),
+        is_webhook_secret_set: Boolean(updated.webhook_secret),
+        is_enabled: updated.is_enabled,
+        source: "database",
+      },
+    });
+  } catch (error) {
+    console.error("Update payment settings error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update payment settings",
     });
   }
 }
@@ -524,4 +618,6 @@ module.exports = {
   testResend,
   getStoreStatus,
   updateStoreStatus,
+  getPayment,
+  updatePayment,
 };
