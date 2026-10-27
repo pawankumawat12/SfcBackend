@@ -1,5 +1,5 @@
 const express = require("express");
-const { verifyToken, isAdmin } = require("../../../middleware/auth.middleware");
+const { verifyToken, isAdminOrStoreOwner } = require("../../../middleware/auth.middleware");
 const {
   // Suppliers
   getSuppliers,
@@ -28,8 +28,8 @@ const {
 
 const router = express.Router();
 
-// All inventory endpoints are strictly Admin-only
-router.use(verifyToken, isAdmin);
+// Inventory endpoints accessible by Admin and Store Owners (scoped per store)
+router.use(verifyToken, isAdminOrStoreOwner);
 
 // Suppliers
 router.get("/suppliers", getSuppliers);

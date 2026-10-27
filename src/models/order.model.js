@@ -7,6 +7,32 @@ function generateOrderNumber() {
   return `SFC-${timestamp}${random}`;
 }
 
+let orderStoreColumnsChecked = false;
+async function ensureOrderStoreColumns() {
+  if (orderStoreColumnsChecked) return;
+  try {
+    await db.raw(`
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_id INTEGER;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_forwarded_to_store BOOLEAN DEFAULT FALSE;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS forwarded_at TIMESTAMPTZ;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_stock_reverted BOOLEAN DEFAULT FALSE;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_gross_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_commission_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS store_payable_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS developer_commission_amount NUMERIC DEFAULT 0;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_net_commission_amount NUMERIC DEFAULT 0;
+      ALTER TABLE order_items ADD COLUMN IF NOT EXISTS store_id INTEGER;
+      ALTER TABLE order_items ADD COLUMN IF NOT EXISTS cost_price NUMERIC(10,2) DEFAULT 0;
+      UPDATE orders
+      SET notes = REPLACE(notes, 'Cashier: undefined', 'Cashier: Admin')
+      WHERE notes LIKE '%Cashier: undefined%';
+    `);
+    orderStoreColumnsChecked = true;
+  } catch (err) {
+    console.warn("[Order Model] Schema self-heal notice:", err.message);
+  }
+}
+
 //order transaction create
 async function createOrderWithTransaction({
   userId,
@@ -23,6 +49,7 @@ async function createOrderWithTransaction({
   offerCode = null,
   finalizeOrder = true,
 }) {
+  await ensureOrderStoreColumns();
   return await db.transaction(async (trx) => {
     const rawCartItems = await trx("cart_items")
       .select([
@@ -36,6 +63,7 @@ async function createOrderWithTransaction({
         "products.images",
         "products.is_active",
         "products.category_id",
+        "products.store_id",
       ])
       .join("products", "cart_items.product_id", "products.id")
       .where("cart_items.user_id", userId)
@@ -67,6 +95,24 @@ async function createOrderWithTransaction({
         throw err;
       }
 
+      // Block order if the product belongs to an INACTIVE or CLOSED store
+      if (item.store_id) {
+        const storeForItem = await trx("stores")
+          .where({ id: item.store_id })
+          .select("id", "name", "is_open", "is_active")
+          .first();
+        if (
+          storeForItem &&
+          (storeForItem.is_active === false || storeForItem.is_open === false)
+        ) {
+          const err = new Error(
+            `"${item.name}" is not available right now. Please remove it from your cart and try again.`
+          );
+          err.statusCode = 400;
+          throw err;
+        }
+      }
+
       const requiredStock = item.total_quantity || item.quantity;
       // MADE_TO_ORDER does not require stock
       if (
@@ -84,7 +130,7 @@ async function createOrderWithTransaction({
     // 4. MINIMUM ORDER VALIDATION
     if (pricing.is_below_minimum_order) {
       const err = new Error(
-        `Minimum order amount is ₹${pricing.minimum_order_amount}. Please add items worth ₹${pricing.minimum_order_shortfall} more to proceed.`
+        `Minimum Item Total (Food value) must be ₹${pricing.minimum_order_amount} (excluding taxes & delivery). Current item total is ₹${pricing.subtotal}. Please add items worth ₹${pricing.minimum_order_shortfall} more to proceed.`
       );
 
       err.statusCode = 400;
@@ -101,13 +147,39 @@ async function createOrderWithTransaction({
       throw err;
     }
 
-    // 6. GENERATE ORDER NUMBER
+    // 6. DETERMINE STORE ASSOCIATION & AUTO-FORWARD STATUS
+    const orderStoreId =
+      enrichedItems.find((i) => i.store_id != null)?.store_id || null;
+
+    let isForwardedToStore = false;
+    let forwardedAt = null;
+
+    if (orderStoreId) {
+      try {
+        const storeRecord = await trx("stores")
+          .where({ id: orderStoreId })
+          .select("auto_forward_orders")
+          .first();
+
+        if (storeRecord && storeRecord.auto_forward_orders === true) {
+          isForwardedToStore = true;
+          forwardedAt = trx.fn.now();
+        }
+      } catch (storeErr) {
+        console.warn("[Order Model] Store auto-forward lookup warning:", storeErr.message);
+      }
+    }
+
+    // 7. GENERATE ORDER NUMBER
     const orderNumber = generateOrderNumber();
 
-    // 7. CREATE LOCAL ORDER
+    // 8. CREATE LOCAL ORDER
     const [order] = await trx("orders")
       .insert({
         order_number: orderNumber,
+        store_id: orderStoreId,
+        is_forwarded_to_store: isForwardedToStore,
+        forwarded_at: forwardedAt,
 
         user_id: userId,
 
@@ -126,6 +198,15 @@ async function createOrderWithTransaction({
         packaging_fee: roundCurrency(pricing.packaging_fee),
         platform_fee: roundCurrency(pricing.platform_fee),
         cod_fee: roundCurrency(pricing.cod_fee),
+
+        // Store Settlement & Commission snapshot (only for branch stores, 0 for Main Bakery)
+        store_gross_amount: orderStoreId ? roundCurrency(pricing.store_gross_amount || 0) : 0,
+        admin_commission_amount: orderStoreId ? roundCurrency(pricing.admin_commission_amount || 0) : 0,
+        store_payable_amount: orderStoreId ? roundCurrency(pricing.store_payable_amount || 0) : 0,
+
+        // Developer Royalty & Tech Earnings snapshot (Admin Only)
+        developer_commission_amount: roundCurrency(pricing.developer_total_earnings || 0),
+        admin_net_commission_amount: roundCurrency(pricing.admin_net_commission || 0),
 
         distance_km: pricing.distance_km || 0,
 
@@ -229,6 +310,8 @@ async function createOrderWithTransaction({
       orderItemsToInsert.push({
         order_id: order.id,
 
+        store_id: item.store_id || orderStoreId,
+
         product_id: item.product_id,
 
         product_name: item.name,
@@ -263,7 +346,7 @@ async function createOrderWithTransaction({
       });
     }
 
-    // Safely check if order_items has paid_quantity column
+    // Safely check if order_items has paid_quantity and store_id columns
     try {
       const hasPaidQtyCol = await trx.schema.hasColumn(
         "order_items",
@@ -274,6 +357,12 @@ async function createOrderWithTransaction({
           delete row.paid_quantity;
           delete row.free_quantity;
           delete row.bogo_details_json;
+        }
+      }
+      const hasStoreIdCol = await trx.schema.hasColumn("order_items", "store_id");
+      if (!hasStoreIdCol) {
+        for (const row of orderItemsToInsert) {
+          delete row.store_id;
         }
       }
     } catch {}
@@ -385,6 +474,32 @@ function getOrderChatStatus(order) {
   };
 }
 
+let cachedAdminContact = null;
+let lastAdminContactFetch = 0;
+async function getAdminContactInfo() {
+  const now = Date.now();
+  if (cachedAdminContact && now - lastAdminContactFetch < 60000) {
+    return cachedAdminContact;
+  }
+  try {
+    const { getFooterSettings } = require("./settings.model");
+    const footer = await getFooterSettings();
+    cachedAdminContact = {
+      admin_address: footer?.location || "SFC Bakers Central Kitchen & Main Bakery",
+      admin_phone: footer?.phone_number || "",
+      admin_email: footer?.email || "",
+    };
+    lastAdminContactFetch = now;
+  } catch (err) {
+    cachedAdminContact = {
+      admin_address: "SFC Bakers Central Kitchen & Main Bakery",
+      admin_phone: "",
+      admin_email: "",
+    };
+  }
+  return cachedAdminContact;
+}
+
 function formatOrderRow(order) {
   if (!order) return null;
   let deliveryAddressJson = order.delivery_address_json;
@@ -407,8 +522,75 @@ function formatOrderRow(order) {
   }
   const chatStatus = getOrderChatStatus(order);
 
+  // Store settlement calculation with fallback for branch store orders (Main Bakery has 0 commission)
+  const isBranchOrder = Boolean(order.store_id) && order.store_name !== "Main Bakery";
+  const subtotal = Number(order.subtotal || 0);
+  const deliveryFee = Number(order.delivery_fee || 0);
+  const packagingFee = Number(order.packaging_fee || 0);
+  const fallbackGross = Math.round(subtotal + deliveryFee + packagingFee);
+
+  const storeGross = isBranchOrder
+    ? Number(
+        order.store_gross_amount != null && Number(order.store_gross_amount) > 0
+          ? order.store_gross_amount
+          : pricingDetailsJson?.store_gross_amount != null
+          ? pricingDetailsJson.store_gross_amount
+          : fallbackGross
+      )
+    : 0;
+
+  const adminCommission = isBranchOrder
+    ? Number(
+        order.admin_commission_amount != null
+          ? order.admin_commission_amount
+          : pricingDetailsJson?.admin_commission_amount != null
+          ? pricingDetailsJson.admin_commission_amount
+          : 0
+      )
+    : 0;
+
+  const storePayable = isBranchOrder
+    ? Number(
+        order.store_payable_amount != null && Number(order.store_payable_amount) > 0
+          ? order.store_payable_amount
+          : pricingDetailsJson?.store_payable_amount != null
+          ? pricingDetailsJson.store_payable_amount
+          : Math.max(0, storeGross - adminCommission)
+      )
+    : 0;
+
+  // Developer Royalty & Tech Earnings (Admin Only)
+  const platformFee = Number(order.platform_fee != null ? order.platform_fee : (pricingDetailsJson?.platform_fee || 0));
+  const developerCommissionShare = Number(
+    pricingDetailsJson?.developer_commission_share != null
+      ? pricingDetailsJson.developer_commission_share
+      : (isBranchOrder ? Math.round(adminCommission * 0.25) : 0)
+  );
+  const developerTotalEarnings = Number(
+    order.developer_commission_amount != null && Number(order.developer_commission_amount) > 0
+      ? order.developer_commission_amount
+      : (pricingDetailsJson?.developer_total_earnings != null
+          ? pricingDetailsJson.developer_total_earnings
+          : Math.round(platformFee + developerCommissionShare))
+  );
+  const adminNetCommission = Number(
+    order.admin_net_commission_amount != null
+      ? order.admin_net_commission_amount
+      : (pricingDetailsJson?.admin_net_commission != null
+          ? pricingDetailsJson.admin_net_commission
+          : Math.max(0, adminCommission - developerCommissionShare))
+  );
+
   return {
     ...order,
+    store_gross_amount: storeGross,
+    admin_commission_amount: adminCommission,
+    store_payable_amount: storePayable,
+    developer_platform_fee: platformFee,
+    developer_commission_share: developerCommissionShare,
+    developer_total_earnings: developerTotalEarnings,
+    developer_total_fee: developerTotalEarnings,
+    admin_net_commission: adminNetCommission,
     delivery_address_json: deliveryAddressJson,
     pricing_details_json: pricingDetailsJson,
     payment_details_json: paymentDetailsJson,
@@ -418,19 +600,39 @@ function formatOrderRow(order) {
 }
 
 async function findOrdersByUser(userId, { page = 1, limit = 10, status = null } = {}) {
+  await ensureOrderStoreColumns();
   const p = Math.max(1, Number(page) || 1);
   const l = Math.max(1, Math.min(100, Number(limit) || 10));
   const offset = (p - 1) * l;
 
-  let query = db("orders").where({ user_id: userId });
+  let query = db("orders as o")
+    .leftJoin("stores as s", "o.store_id", "s.id")
+    .leftJoin("users as owner", "s.owner_id", "owner.id")
+    .select(
+      "o.*",
+      "s.name as store_name",
+      "s.latitude as store_latitude",
+      "s.longitude as store_longitude",
+      "s.address as store_address",
+      "s.phone as store_phone",
+      "owner.phone as store_owner_phone",
+      "owner.name as store_owner_name"
+    )
+    .where("o.user_id", userId);
 
   if (status && String(status).trim() && String(status).toLowerCase() !== "all") {
-    query = query.where({ status });
+    query = query.where("o.status", status);
   }
 
-  const [orders, countRow] = await Promise.all([
-    query.clone().orderBy("created_at", "desc").limit(l).offset(offset),
-    query.clone().count("id as count").first(),
+  let countQuery = db("orders as o").where("o.user_id", userId);
+  if (status && String(status).trim() && String(status).toLowerCase() !== "all") {
+    countQuery = countQuery.where("o.status", status);
+  }
+
+  const [orders, countRow, adminContact] = await Promise.all([
+    query.orderBy("o.created_at", "desc").limit(l).offset(offset),
+    countQuery.count("o.id as count").first(),
+    getAdminContactInfo(),
   ]);
 
   const total = Number(countRow?.count || 0);
@@ -461,6 +663,9 @@ async function findOrdersByUser(userId, { page = 1, limit = 10, status = null } 
   return {
     orders: orders.map((o) => ({
       ...formatOrderRow(o),
+      admin_address: adminContact.admin_address,
+      admin_phone: adminContact.admin_phone,
+      admin_email: adminContact.admin_email,
       items: itemsByOrder[o.id] || [],
     })),
     pagination: {
@@ -473,17 +678,33 @@ async function findOrdersByUser(userId, { page = 1, limit = 10, status = null } 
 }
 
 async function findOrderById(orderId, userId = null) {
-  let query = db("orders");
+  await ensureOrderStoreColumns();
+  let query = db("orders as o")
+    .leftJoin("stores as s", "o.store_id", "s.id")
+    .leftJoin("users as owner", "s.owner_id", "owner.id")
+    .select(
+      "o.*",
+      "s.name as store_name",
+      "s.latitude as store_latitude",
+      "s.longitude as store_longitude",
+      "s.address as store_address",
+      "s.phone as store_phone",
+      "owner.phone as store_owner_phone",
+      "owner.name as store_owner_name"
+    );
   const trimmed = String(orderId || "").trim();
   if (/^\d+$/.test(trimmed)) {
-    query = query.where({ id: Number(trimmed) });
+    query = query.where("o.id", Number(trimmed));
   } else {
-    query = query.where({ order_number: trimmed });
+    query = query.where("o.order_number", trimmed);
   }
   if (userId) {
-    query = query.where({ user_id: userId });
+    query = query.where("o.user_id", userId);
   }
-  const order = await query.first();
+  const [order, adminContact] = await Promise.all([
+    query.first(),
+    getAdminContactInfo(),
+  ]);
   if (!order) return null;
 
   const items = await db("order_items")
@@ -492,36 +713,266 @@ async function findOrderById(orderId, userId = null) {
 
   return {
     ...formatOrderRow(order),
+    admin_address: adminContact.admin_address,
+    admin_phone: adminContact.admin_phone,
+    admin_email: adminContact.admin_email,
     items,
   };
 }
 
-async function findAllOrders({ page = 1, limit = 20, status, search }) {
+async function findAllOrders({ page = 1, limit = 20, status, search, storeId, isForwardedOnly = false, startDate, endDate }) {
+  await ensureOrderStoreColumns();
   const p = Math.max(1, Number(page) || 1);
   const l = Math.max(1, Math.min(100, Number(limit) || 20));
   const offset = (p - 1) * l;
-  let query = db("orders");
+  let query = db("orders as o")
+    .leftJoin("stores as s", "o.store_id", "s.id")
+    .leftJoin("users as owner", "s.owner_id", "owner.id")
+    .select(
+      "o.*",
+      "s.name as store_name",
+      "s.latitude as store_latitude",
+      "s.longitude as store_longitude",
+      "s.address as store_address",
+      "s.phone as store_phone",
+      "owner.phone as store_owner_phone",
+      "owner.name as store_owner_name",
+      "s.auto_forward_orders as store_auto_forward_orders"
+    );
+
+  if (storeId) {
+    query = query.where("o.store_id", storeId);
+    // Never show orders in store order list that were delivered directly by Admin without being dispatched to the store
+    query = query.whereNot(function () {
+      this.where("o.is_forwarded_to_store", false).whereIn(db.raw("LOWER(o.status)"), [
+        "delivered",
+        "completed",
+      ]);
+    });
+  }
+
+  if (isForwardedOnly) {
+    query = query.where("o.is_forwarded_to_store", true);
+  }
+
+  // Base query for unconstrained store/admin metrics across all statuses
+  let baseStatsQuery = db("orders as o");
+  if (storeId) {
+    baseStatsQuery = baseStatsQuery.where("o.store_id", storeId);
+    baseStatsQuery = baseStatsQuery.whereNot(function () {
+      this.where("o.is_forwarded_to_store", false).whereIn(db.raw("LOWER(o.status)"), [
+        "delivered",
+        "completed",
+      ]);
+    });
+  }
+  if (isForwardedOnly) {
+    baseStatsQuery = baseStatsQuery.where("o.is_forwarded_to_store", true);
+  }
 
   if (status && status !== "all" && status !== "") {
-    query = query.where({ status });
+    query = query.where("o.status", status);
   }
 
   if (search && String(search).trim()) {
     const s = `%${String(search).trim()}%`;
     query = query.where(function () {
-      this.whereILike("order_number", s)
-        .orWhereILike("customer_name", s)
-        .orWhereILike("customer_email", s)
-        .orWhereILike("customer_phone", s);
+      this.whereILike("o.order_number", s)
+        .orWhereILike("o.customer_name", s)
+        .orWhereILike("o.customer_email", s)
+        .orWhereILike("o.customer_phone", s)
+        .orWhereILike("s.name", s);
     });
   }
 
-  const [orders, countRow] = await Promise.all([
-    query.clone().orderBy("created_at", "desc").limit(l).offset(offset),
-    query.clone().count("id as count").first(),
+  if (startDate) {
+    query = query.where("o.created_at", ">=", startDate);
+    baseStatsQuery = baseStatsQuery.where("o.created_at", ">=", startDate);
+  }
+
+  if (endDate) {
+    query = query.where("o.created_at", "<=", endDate);
+    baseStatsQuery = baseStatsQuery.where("o.created_at", "<=", endDate);
+  }
+
+  const [orders, countRow, statsRow] = await Promise.all([
+    query.clone().orderBy("o.created_at", "desc").limit(l).offset(offset),
+    query.clone().clearSelect().clearOrder().count("o.id as count").first(),
+    baseStatsQuery
+      .select([
+        db.raw("COUNT(o.id)::int as total_orders"),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+              THEN o.total_amount
+              ELSE 0
+            END
+          ), 0)::float as total_amount
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+              THEN COALESCE(o.admin_commission_amount, 0)
+              ELSE 0
+            END
+          ), 0)::float as total_commission
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+              THEN COALESCE(
+                o.store_payable_amount,
+                o.store_gross_amount,
+                (COALESCE(o.subtotal, 0) + COALESCE(o.delivery_fee, 0) + COALESCE(o.packaging_fee, 0))
+              )
+              ELSE 0
+            END
+          ), 0)::float as total_store_payable
+        `),
+        db.raw(`
+          COUNT(CASE 
+            WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                 AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                 AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+            THEN 1 
+          END)::int as online_orders_count
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN o.total_amount
+              ELSE 0
+            END
+          ), 0)::float as online_total_amount
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(o.admin_commission_amount, 0)
+              ELSE 0
+            END
+          ), 0)::float as online_commission
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND NOT (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(
+                o.store_payable_amount,
+                o.store_gross_amount,
+                (COALESCE(o.subtotal, 0) + COALESCE(o.delivery_fee, 0) + COALESCE(o.packaging_fee, 0))
+              )
+              ELSE 0
+            END
+          ), 0)::float as online_store_payable
+        `),
+        db.raw(`
+          COUNT(CASE 
+            WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                 AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                 AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+            THEN 1 
+          END)::int as cod_orders_count
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN o.total_amount
+              ELSE 0
+            END
+          ), 0)::float as cod_total_amount
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(o.admin_commission_amount, 0)
+              ELSE 0
+            END
+          ), 0)::float as cod_commission
+        `),
+        db.raw(`
+          COALESCE(SUM(
+            CASE 
+              WHEN LOWER(o.status) NOT IN ('cancelled', 'rejected', 'payment failed')
+                   AND LOWER(COALESCE(o.payment_status, '')) NOT IN ('failed', 'refunded')
+                   AND o.store_id IS NOT NULL
+                   AND o.is_forwarded_to_store = true
+                   AND (LOWER(COALESCE(o.payment_method, '')) LIKE '%cash%' OR LOWER(COALESCE(o.payment_method, '')) LIKE '%cod%')
+              THEN COALESCE(
+                o.store_payable_amount,
+                o.store_gross_amount,
+                (COALESCE(o.subtotal, 0) + COALESCE(o.delivery_fee, 0) + COALESCE(o.packaging_fee, 0))
+              )
+              ELSE 0
+            END
+          ), 0)::float as cod_store_payable
+        `),
+        db.raw("COUNT(CASE WHEN LOWER(o.status) = 'preparing' THEN 1 END)::int as preparing_orders"),
+        db.raw("COUNT(CASE WHEN LOWER(o.status) IN ('out for delivery', 'out_for_delivery') THEN 1 END)::int as out_for_delivery_orders"),
+        db.raw("COUNT(CASE WHEN LOWER(o.status) = 'delivered' THEN 1 END)::int as delivered_orders"),
+        db.raw("COUNT(CASE WHEN LOWER(o.status) IN ('cancelled', 'rejected') THEN 1 END)::int as cancelled_orders"),
+        db.raw("COUNT(CASE WHEN LOWER(o.status) NOT IN ('delivered', 'cancelled', 'rejected') THEN 1 END)::int as pending_orders"),
+        db.raw("COALESCE(SUM(CASE WHEN LOWER(o.status) = 'delivered' THEN o.total_amount END), 0)::float as delivered_amount"),
+      ])
+      .first(),
   ]);
 
   const total = Number(countRow?.count || 0);
+  const onlineStorePayable = Math.round(Number(statsRow?.online_store_payable || 0));
+  const codCommission = Math.round(Number(statsRow?.cod_commission || 0));
+  const netStorePayout = onlineStorePayable - codCommission;
+
+  const stats = {
+    totalOrders: Number(statsRow?.total_orders || total),
+    totalAmount: Math.round(Number(statsRow?.total_amount || 0)),
+    totalCommission: Math.round(Number(statsRow?.total_commission || 0)),
+    totalStorePayable: Math.round(Number(statsRow?.total_store_payable || 0)),
+    onlineOrdersCount: Number(statsRow?.online_orders_count || 0),
+    onlineTotalAmount: Math.round(Number(statsRow?.online_total_amount || 0)),
+    onlineCommission: Math.round(Number(statsRow?.online_commission || 0)),
+    onlineStorePayable,
+    codOrdersCount: Number(statsRow?.cod_orders_count || 0),
+    codTotalAmount: Math.round(Number(statsRow?.cod_total_amount || 0)),
+    codCommission,
+    codStorePayable: Math.round(Number(statsRow?.cod_store_payable || 0)),
+    netStorePayout,
+    preparingOrders: Number(statsRow?.preparing_orders || 0),
+    outForDeliveryOrders: Number(statsRow?.out_for_delivery_orders || 0),
+    deliveredOrders: Number(statsRow?.delivered_orders || 0),
+    cancelledOrders: Number(statsRow?.cancelled_orders || 0),
+    pendingOrders: Number(statsRow?.pending_orders || 0),
+    deliveredAmount: Math.round(Number(statsRow?.delivered_amount || 0)),
+  };
 
   if (!orders.length) {
     return {
@@ -532,6 +983,7 @@ async function findAllOrders({ page = 1, limit = 20, status, search }) {
         limit: l,
         totalPages: Math.ceil(total / l) || 1,
       },
+      stats,
     };
   }
 
@@ -557,13 +1009,68 @@ async function findAllOrders({ page = 1, limit = 20, status, search }) {
       limit: l,
       totalPages: Math.ceil(total / l) || 1,
     },
+    stats,
   };
 }
 
+async function forwardOrderToStore(orderId, storeId = null) {
+  await ensureOrderStoreColumns();
+  const order = await db("orders").where({ id: orderId }).first();
+  if (!order) {
+    const err = new Error("Order not found");
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const orderStatus = (order.status || "").toLowerCase();
+  if (orderStatus === "delivered" || orderStatus === "completed") {
+    const err = new Error("This order was already delivered directly by Admin and cannot be forwarded to a store.");
+    err.statusCode = 400;
+    throw err;
+  }
+  if (orderStatus === "cancelled") {
+    const err = new Error("Cannot forward a cancelled order to a store.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const targetStoreId = storeId || order.store_id;
+  if (!targetStoreId) {
+    const err = new Error("No store assigned to this order. Please select a store first.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  await db("orders")
+    .where({ id: orderId })
+    .update({
+      store_id: targetStoreId,
+      is_forwarded_to_store: true,
+      forwarded_at: db.fn.now(),
+      updated_at: db.fn.now(),
+    });
+
+  await db("order_items")
+    .where({ order_id: orderId })
+    .update({ store_id: targetStoreId });
+
+  return findOrderById(orderId);
+}
+
 async function updateOrderStatus(orderId, status) {
+  await ensureOrderStoreColumns();
   const order = await db("orders").where({ id: orderId }).first();
   if (!order) {
     throw new Error("Order not found");
+  }
+
+  // Critical Guard: Once an order is Cancelled, its status is immutable and cannot be modified by anyone
+  if (order.status === "Cancelled") {
+    const err = new Error(
+      "Cannot change status: This order was cancelled and its status cannot be modified."
+    );
+    err.statusCode = 400;
+    throw err;
   }
 
   // Guard: Cannot advance unpaid online order to in-progress or completed states
@@ -584,18 +1091,73 @@ async function updateOrderStatus(orderId, status) {
     updated_at: db.fn.now(),
   };
 
-  if (status === "Delivered" || status === "Completed") {
+  const isDeliveredNow = status === "Delivered" || status === "Completed";
+
+  if (isDeliveredNow) {
     updatePayload.payment_status = "Paid";
     if (!order.delivered_at) {
       updatePayload.delivered_at = db.fn.now();
     }
   }
 
-  const [updated] = await db("orders")
-    .where({ id: orderId })
-    .update(updatePayload)
-    .returning("*");
-  return updated;
+  return db.transaction(async (trx) => {
+    // If Admin fulfills/delivers an order directly (never dispatched/forwarded to store) containing store products:
+    // Do NOT consume or deduct the store's physical product stock or raw materials!
+    // Restore the store's product stock and raw ingredient stock back to the store.
+    if (
+      isDeliveredNow &&
+      !order.is_forwarded_to_store &&
+      order.store_id &&
+      !order.store_stock_reverted
+    ) {
+      const items = await trx("order_items").where({ order_id: orderId });
+      for (const item of items) {
+        if (item.availability_type !== "MADE_TO_ORDER") {
+          const product = await trx("products").where({ id: item.product_id }).first();
+          // If the product belongs to a store, restore the deducted stock
+          if (product && product.store_id) {
+            await trx("products")
+              .where({ id: item.product_id })
+              .increment("stock", item.quantity);
+          }
+        }
+      }
+
+      // Restore raw ingredients if previously deducted
+      if (order.ingredient_stock_deducted) {
+        try {
+          const { restoreIngredientStockForOrder } = require("../services/inventory.service");
+          await restoreIngredientStockForOrder(
+            orderId,
+            trx,
+            "Admin delivered order directly from central kitchen; restored store raw materials and product stock."
+          );
+        } catch (restErr) {
+          console.warn(
+            "[OrderModel] Warning during ingredient stock restoration on Admin direct delivery:",
+            restErr.message
+          );
+        }
+      }
+
+      // Direct Admin Delivery: Store was not involved, so branch payable and admin commission are 0.
+      // Developer receives 100% of the platform fee only (no commission cut).
+      updatePayload.store_payable_amount = 0;
+      updatePayload.store_gross_amount = 0;
+      updatePayload.admin_commission_amount = 0;
+      updatePayload.admin_net_commission_amount = 0;
+      updatePayload.developer_commission_amount = Number(order.platform_fee || 0);
+
+      updatePayload.store_stock_reverted = true;
+    }
+
+    const [updated] = await trx("orders")
+      .where({ id: orderId })
+      .update(updatePayload)
+      .returning("*");
+
+    return updated;
+  });
 }
 
 async function updateItemProductionStatus(orderItemId, productionStatus) {
@@ -678,6 +1240,15 @@ async function acceptOrder(orderId, { notes = null } = {}) {
     throw new Error("Order not found");
   }
 
+  // Guard: Cancelled orders cannot be accepted by admin or store owner
+  if (order.status === "Cancelled") {
+    const err = new Error(
+      "Cannot accept order: This order was cancelled and cannot be accepted."
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+
   // Guard: Unpaid online payment orders cannot be accepted or prepared
   if (order.payment_method !== "Cash on Delivery" && order.payment_status !== "Paid") {
     const err = new Error(
@@ -705,6 +1276,15 @@ async function acceptOrder(orderId, { notes = null } = {}) {
 }
 
 async function rejectOrder(orderId, { cancelReason = "Order rejected by store" } = {}) {
+  const order = await db("orders").where({ id: orderId }).first();
+  if (!order) {
+    throw new Error("Order not found");
+  }
+  if (order.status === "Cancelled") {
+    const err = new Error("This order is already cancelled.");
+    err.statusCode = 400;
+    throw err;
+  }
   return cancelOrder(orderId, cancelReason);
 }
 
@@ -722,6 +1302,16 @@ async function bulkUpdateOrderStatus(ids, targetStatus, { cancelReason = "Cancel
   const otherSkipped = [];
 
   for (const order of orders) {
+    // Critical Guard: Cancelled orders can never be changed in bulk
+    if (order.status === "Cancelled") {
+      otherSkipped.push({
+        id: order.id,
+        orderNumber: order.order_number,
+        reason: "Order was cancelled and its status is locked",
+      });
+      continue;
+    }
+
     // Payment Guardrail: cannot advance unpaid online orders to in-progress or fulfilled states
     const isUnpaidOnline =
       order.payment_method === "Online Payment" && order.payment_status !== "Paid";
@@ -748,20 +1338,7 @@ async function bulkUpdateOrderStatus(ids, targetStatus, { cancelReason = "Cancel
         const cancelled = await cancelOrder(order.id, cancelReason);
         updatedOrders.push(cancelled);
       } else {
-        const updatePayload = {
-          status: targetStatus,
-          updated_at: db.fn.now(),
-        };
-        if (targetStatus === "Delivered" || targetStatus === "Completed") {
-          updatePayload.payment_status = "Paid";
-          if (!order.delivered_at) {
-            updatePayload.delivered_at = db.fn.now();
-          }
-        }
-        const [updated] = await db("orders")
-          .where({ id: order.id })
-          .update(updatePayload)
-          .returning("*");
+        const updated = await updateOrderStatus(order.id, targetStatus);
         updatedOrders.push(updated);
       }
     } catch (err) {
@@ -794,5 +1371,7 @@ module.exports = {
   updateOrderPaymentStatus,
   acceptOrder,
   rejectOrder,
+  forwardOrderToStore,
   getOrderChatStatus,
+  ensureOrderStoreColumns,
 };

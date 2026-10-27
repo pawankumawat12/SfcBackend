@@ -1,12 +1,36 @@
+const db = require("../../../config/db");
 const orderModel = require("../../models/order.model");
 const orderMessageModel = require("../../models/orderMessage.model");
 const notificationModel = require("../../models/notification.model");
 const { emitToOrder, emitToAdmin, emitToUser, isAdminInOrderRoom, isCustomerInOrderRoom } = require("../../socket/socket.service");
 const { uploadFile } = require("../../services/storage/storage.service");
 
-/**
- * Get chat history for a specific order and mark unread messages as read
- */
+
+async function canUserAccessOrderChat(user, order) {
+  if (user.role === "admin") {
+    return { allowed: true, senderRole: "admin" };
+  }
+  if (Number(order.user_id) === Number(user.id)) {
+    return { allowed: true, senderRole: "customer" };
+  }
+  if (user.role === "store_owner") {
+    const userStoreId = user.store_id;
+    if (!userStoreId || Number(order.store_id) !== Number(userStoreId)) {
+      return { allowed: false, message: "Unauthorized: This order does not belong to your store." };
+    }
+    const store = await db("stores").where({ id: userStoreId }).first();
+    if (!store || !store.auto_forward_orders) {
+      return {
+        allowed: false,
+        message: "Order chat is restricted to stores with Direct Order Dispatch permission enabled.",
+      };
+    }
+    return { allowed: true, senderRole: "admin", storeName: store.name };
+  }
+  return { allowed: false, message: "Unauthorized access to order chat" };
+}
+
+
 async function getOrderMessages(req, res) {
   try {
     const { id: orderId } = req.params;
@@ -17,9 +41,10 @@ async function getOrderMessages(req, res) {
       return res.status(404).json({ success: false, message: "Order not found" });
     }
 
-    // Check ownership if not admin
-    if (user.role !== "admin" && Number(order.user_id) !== Number(user.id)) {
-      return res.status(403).json({ success: false, message: "Unauthorized access to order chat" });
+    // Check ownership & store dispatch permission
+    const access = await canUserAccessOrderChat(user, order);
+    if (!access.allowed) {
+      return res.status(403).json({ success: false, message: access.message });
     }
 
     const messages = await orderMessageModel.getMessagesByOrderId(orderId);
@@ -48,9 +73,7 @@ async function getOrderMessages(req, res) {
   }
 }
 
-/**
- * Post a new message to an order chat
- */
+
 async function postOrderMessage(req, res) {
   try {
     const { id: orderId } = req.params;
@@ -104,26 +127,23 @@ async function postOrderMessage(req, res) {
       });
     }
 
-    // Check ownership if not admin
-    if (user.role !== "admin" && Number(order.user_id) !== Number(user.id)) {
-      return res.status(403).json({ success: false, message: "Unauthorized to post message in this order" });
+    // Check chat access permission
+    const access = await canUserAccessOrderChat(user, order);
+    if (!access.allowed) {
+      return res.status(403).json({ success: false, message: access.message });
     }
 
     const requestedRole = req.body.senderRole;
-    let senderRole = "customer";
-    if (requestedRole === "admin" && user.role === "admin") {
-      senderRole = "admin";
-    } else if (requestedRole === "customer") {
-      senderRole = "customer";
-    } else if (user.role === "admin" && Number(order.user_id) !== Number(user.id)) {
+    let senderRole = access.senderRole;
+    if (access.senderRole === "admin") {
       senderRole = "admin";
     } else {
-      senderRole = "customer";
+      senderRole = requestedRole === "customer" ? "customer" : "customer";
     }
 
     const senderName =
       senderRole === "admin"
-        ? "SFC Bakers"
+        ? (access.storeName ? `${access.storeName} Support` : "SFC Bakers")
         : (order.customer_name || user.name || "Customer");
 
     // Persist message in database
@@ -132,7 +152,7 @@ async function postOrderMessage(req, res) {
       senderId: user.id,
       senderRole,
       senderName,
-      message: message || (attachmentType === "image" ? "📷 Photo" : "📄 Document"),
+      message: message || (attachmentType === "image" ? " Photo" : " Document"),
       attachmentUrl,
       attachmentType,
       attachmentName,
@@ -148,10 +168,7 @@ async function postOrderMessage(req, res) {
       message: savedMessage,
     });
 
-    // 2. Send notification to counterpart only if they are NOT actively in this chat room.
-    //    If the recipient is present in order_<id> room, they already see the live message —
-    //    no notification badge is needed. If they're offline/disconnected, save it to DB
-    //    so the badge appears when they return.
+  
     if (senderRole === "customer") {
       // Notify admin only when no admin socket is in this order room
       const adminPresent = isAdminInOrderRoom(orderId);

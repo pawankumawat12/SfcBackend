@@ -44,7 +44,7 @@ async function validateOfferCode(req, res) {
     for (const it of items) {
       subtotal += (Number(it.price) || 0) * (Number(it.quantity) || 1);
     }
-    subtotal = Math.round(subtotal * 100) / 100;
+    subtotal = Math.round(subtotal);
 
     const evaluation = await offerModel.evaluateCartOffer({
       offerCode: code,

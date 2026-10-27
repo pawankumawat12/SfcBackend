@@ -27,6 +27,9 @@ function findCategories({
   limit,
   offset,
   parentCategoryId,
+  storeId,
+  includeAdmin = false,
+  adminOnly = false,
   isActive,
   search,
   sortBy = "created_at",
@@ -41,6 +44,15 @@ function findCategories({
       query = query.where({ parent_category_id: parentCategoryId });
     }
   }
+
+  if (storeId !== undefined) {
+    // Strictly show only categories assigned to this branch store
+    query = query.whereIn(
+      "id",
+      db("store_categories").select("category_id").where({ store_id: storeId })
+    );
+  }
+  // Note: For Admin store (adminOnly or storeId undefined), all categories created by Admin are shown.
 
   if (isActive !== undefined) {
     query = query.where({ is_active: isActive });
@@ -61,7 +73,7 @@ function findCategories({
     .offset(offset);
 }
 
-function countCategories({ parentCategoryId, isActive, search }) {
+function countCategories({ parentCategoryId, storeId, includeAdmin = false, adminOnly = false, isActive, search }) {
   let query = db("categories");
 
   if (parentCategoryId !== undefined) {
@@ -70,6 +82,13 @@ function countCategories({ parentCategoryId, isActive, search }) {
     } else {
       query = query.where({ parent_category_id: parentCategoryId });
     }
+  }
+
+  if (storeId !== undefined) {
+    query = query.whereIn(
+      "id",
+      db("store_categories").select("category_id").where({ store_id: storeId })
+    );
   }
 
   if (isActive !== undefined) {
@@ -190,12 +209,29 @@ async function bulkDeleteCategories(ids) {
   };
 }
 
+async function getCategoryStats() {
+  const statsRow = await db("categories")
+    .select([
+      db.raw("COUNT(*)::int as total"),
+      db.raw("COUNT(CASE WHEN is_active = true THEN 1 END)::int as active"),
+      db.raw("COUNT(CASE WHEN is_active = false THEN 1 END)::int as inactive"),
+    ])
+    .first();
+
+  return {
+    total: Number(statsRow?.total || 0),
+    active: Number(statsRow?.active || 0),
+    inactive: Number(statsRow?.inactive || 0),
+  };
+}
+
 module.exports = {
   findCategoryById,
   findCategories,
   findCategoriesByIds,
   countCategories,
   countChildCategories,
+  getCategoryStats,
   createCategory,
   updateCategory,
   deleteCategory,

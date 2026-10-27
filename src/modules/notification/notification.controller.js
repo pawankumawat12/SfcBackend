@@ -1,15 +1,24 @@
 const notificationModel = require("../../models/notification.model");
 
+function resolveRole(user) {
+  if (!user) return "customer";
+  if (user.role === "admin" || user.role === "manager") return "admin";
+  if (user.role === "store_owner") return "store_owner";
+  return "customer";
+}
+
 async function listNotifications(req, res) {
   try {
     const user = req.user;
-    const role = user.role === "admin" ? "admin" : "customer";
+    const role = resolveRole(user);
+    const storeId = user.store_id || null;
     const page = parseInt(req.query.page, 10) || 1;
     const limit = parseInt(req.query.limit, 10) || 20;
 
     const result = await notificationModel.getNotifications({
       userId: user.id,
       role,
+      storeId,
       page,
       limit,
     });
@@ -17,6 +26,7 @@ async function listNotifications(req, res) {
     const unreadCount = await notificationModel.getUnreadNotificationCount({
       userId: user.id,
       role,
+      storeId,
     });
 
     return res.status(200).json({
@@ -36,11 +46,13 @@ async function listNotifications(req, res) {
 async function getUnreadCount(req, res) {
   try {
     const user = req.user;
-    const role = user.role === "admin" ? "admin" : "customer";
+    const role = resolveRole(user);
+    const storeId = user.store_id || null;
 
     const count = await notificationModel.getUnreadNotificationCount({
       userId: user.id,
       role,
+      storeId,
     });
 
     return res.status(200).json({
@@ -71,11 +83,13 @@ async function markRead(req, res) {
 async function markAllRead(req, res) {
   try {
     const user = req.user;
-    const role = user.role === "admin" ? "admin" : "customer";
+    const role = resolveRole(user);
+    const storeId = user.store_id || null;
 
     await notificationModel.markAllNotificationsAsRead({
       userId: user.id,
       role,
+      storeId,
     });
 
     return res.status(200).json({
@@ -88,59 +102,9 @@ async function markAllRead(req, res) {
   }
 }
 
-async function registerAdminDeviceToken(req, res) {
-  try {
-    const user = req.user;
-    if (user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
-
-    const { token, deviceType, deviceInfo } = req.body;
-    if (!token) {
-      return res.status(400).json({ success: false, message: "Token is required" });
-    }
-
-    const fcmService = require("../../services/fcmNotification.service");
-    const result = await fcmService.registerAdminToken({
-      userId: user.id,
-      token,
-      deviceType: deviceType || "web",
-      deviceInfo: deviceInfo || req.headers["user-agent"] || null,
-    });
-
-    return res.status(200).json(result);
-  } catch (error) {
-    console.error("Error registering admin device token:", error);
-    return res.status(500).json({ success: false, message: "Failed to register token" });
-  }
-}
-
-async function unregisterAdminDeviceToken(req, res) {
-  try {
-    const user = req.user;
-    if (user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Admin access required" });
-    }
-
-    const { token } = req.body;
-    if (!token) {
-      return res.status(400).json({ success: false, message: "Token is required" });
-    }
-
-    const fcmService = require("../../services/fcmNotification.service");
-    const result = await fcmService.unregisterAdminToken({ token });
-    return res.status(200).json(result);
-  } catch (error) {
-    console.error("Error unregistering admin device token:", error);
-    return res.status(500).json({ success: false, message: "Failed to unregister token" });
-  }
-}
-
 module.exports = {
   listNotifications,
   getUnreadCount,
   markRead,
   markAllRead,
-  registerAdminDeviceToken,
-  unregisterAdminDeviceToken,
 };

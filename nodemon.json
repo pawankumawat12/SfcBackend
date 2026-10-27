@@ -1,0 +1,22 @@
+{
+  "watch": [
+    "src",
+    "config",
+    "middleware",
+    "app.js",
+    "server.js"
+  ],
+  "ext": "js,mjs,cjs,json",
+  "ignore": [
+    ".whatsapp_auth/**",
+    ".whatsapp_auth/*",
+    "whatsapp_auth/**",
+    "whatsapp_auth/*",
+    "uploads/**",
+    "uploads/*",
+    "node_modules/**",
+    "*.log"
+  ],
+  "delay": 1500
+}
+

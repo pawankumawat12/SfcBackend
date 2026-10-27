@@ -6,16 +6,37 @@ const {
   getApplicableOffersForProduct,
 } = require("./offer.model");
 
+let productSchemaChecked = false;
+async function ensureProductColumns() {
+  if (productSchemaChecked) return;
+  try {
+    await db.raw(`
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS is_pos_only BOOLEAN DEFAULT FALSE;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(255);
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS expiry_date DATE;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS cost_price NUMERIC(10,2) DEFAULT 0;
+    `);
+    productSchemaChecked = true;
+  } catch (err) {
+    console.warn("[Product Model] Schema self-heal notice:", err.message);
+  }
+}
+
 const PRODUCT_COLUMNS = [
   "products.id",
   "products.name",
   "products.description",
   "products.price",
+  "products.cost_price",
   "products.stock",
   "products.availability_type",
   "products.images",
   "products.category_id",
+  "products.store_id",
   "products.is_active",
+  "products.is_pos_only",
+  "products.barcode",
+  "products.expiry_date",
   "products.image_keys",
   "products.storage_provider",
   "products.created_at",
@@ -34,6 +55,7 @@ function serializeImages(data) {
 }
 
 async function findProductById(id) {
+  await ensureProductColumns();
   const row = await db("products")
     .select([
       ...PRODUCT_COLUMNS,
@@ -66,17 +88,23 @@ async function findProductById(id) {
 }
 
 
-function findProducts({
+async function findProducts({
   page,
   limit,
   offset,
   categoryId,
+  storeId,
+  includeAdmin = false,
+  adminOnly = false,
   isActive,
   availabilityType,
+  includePos = false,
+  posOnly = false,
   search,
   sortBy = "products.created_at",
   sortOrder = "desc",
 }) {
+  await ensureProductColumns();
   let query = db("products")
     .select([
       ...PRODUCT_COLUMNS,
@@ -95,6 +123,20 @@ function findProducts({
     query = query.where("products.category_id", categoryId);
   }
 
+  if (adminOnly) {
+    // Show only products created by admin (store_id is null)
+    query = query.whereNull("products.store_id");
+  } else if (storeId !== undefined) {
+    if (includeAdmin) {
+      query = query.where(function () {
+        this.where("products.store_id", storeId).orWhereNull("products.store_id");
+      });
+    } else {
+      // Show only products belonging to this specific store
+      query = query.where("products.store_id", storeId);
+    }
+  }
+
   if (isActive !== undefined) {
     query = query.where("products.is_active", isActive);
   }
@@ -103,12 +145,19 @@ function findProducts({
     query = query.where("products.availability_type", availabilityType);
   }
 
+  if (posOnly) {
+    query = query.where("products.is_pos_only", true);
+  } else if (!includePos) {
+    query = query.where(function () {
+      this.whereNull("products.is_pos_only").orWhere("products.is_pos_only", false);
+    });
+  }
+
   if (search) {
     query = query.where(function () {
-      this.whereILike("products.name", `%${search}%`).orWhereILike(
-        "products.description",
-        `%${search}%`,
-      );
+      this.whereILike("products.name", `%${search}%`)
+        .orWhereILike("products.description", `%${search}%`)
+        .orWhereILike("products.barcode", `%${search}%`);
     });
   }
 
@@ -119,11 +168,34 @@ function findProducts({
     .offset(offset);
 }
 
-function countProducts({ categoryId, isActive, availabilityType, search }) {
+async function countProducts({
+  categoryId,
+  storeId,
+  includeAdmin = false,
+  adminOnly = false,
+  isActive,
+  availabilityType,
+  includePos = false,
+  posOnly = false,
+  search,
+}) {
+  await ensureProductColumns();
   let query = db("products");
 
   if (categoryId !== undefined) {
     query = query.where({ category_id: categoryId });
+  }
+
+  if (adminOnly) {
+    query = query.whereNull("products.store_id");
+  } else if (storeId !== undefined) {
+    if (includeAdmin) {
+      query = query.where(function () {
+        this.where("products.store_id", storeId).orWhereNull("products.store_id");
+      });
+    } else {
+      query = query.where({ store_id: storeId });
+    }
   }
 
   if (isActive !== undefined) {
@@ -134,17 +206,24 @@ function countProducts({ categoryId, isActive, availabilityType, search }) {
     query = query.where({ availability_type: availabilityType });
   }
 
+  if (posOnly) {
+    query = query.where("products.is_pos_only", true);
+  } else if (!includePos) {
+    query = query.where(function () {
+      this.whereNull("products.is_pos_only").orWhere("products.is_pos_only", false);
+    });
+  }
+
   if (search) {
     query = query.where(function () {
-      this.whereILike("name", `%${search}%`).orWhereILike(
-        "description",
-        `%${search}%`,
-      );
+      this.whereILike("name", `%${search}%`)
+        .orWhereILike("description", `%${search}%`)
+        .orWhereILike("barcode", `%${search}%`);
     });
   }
 
   return query
-    .count("id as count")
+    .count("products.id as count")
     .first()
     .then((row) => Number(row.count || 0));
 }
@@ -152,12 +231,13 @@ function countProducts({ categoryId, isActive, availabilityType, search }) {
 function countProductsByCategory(categoryId) {
   return db("products")
     .where({ category_id: categoryId })
-    .count("id as count")
+    .count("products.id as count")
     .first()
     .then((row) => Number(row.count || 0));
 }
 
-function createProduct(data) {
+async function createProduct(data) {
+  await ensureProductColumns();
   return db("products")
     .insert(serializeImages(data))
     .returning([
@@ -165,18 +245,24 @@ function createProduct(data) {
       "name",
       "description",
       "price",
+      "cost_price",
       "stock",
       "availability_type",
       "images",
       "category_id",
+      "store_id",
       "is_active",
+      "is_pos_only",
+      "barcode",
+      "expiry_date",
       "created_at",
       "updated_at",
     ])
     .then((rows) => rows[0]);
 }
 
-function updateProduct(id, data) {
+async function updateProduct(id, data) {
+  await ensureProductColumns();
   return db("products")
     .where({ id })
     .update(serializeImages(data))
@@ -185,11 +271,15 @@ function updateProduct(id, data) {
       "name",
       "description",
       "price",
+      "cost_price",
       "stock",
       "availability_type",
       "images",
       "category_id",
       "is_active",
+      "is_pos_only",
+      "barcode",
+      "expiry_date",
       "created_at",
       "updated_at",
     ])
@@ -200,10 +290,15 @@ function deleteProduct(id) {
   return db("products").where({ id }).del();
 }
 
-function bulkUpdateProductStatus(ids, isActive) {
+function bulkUpdateProductStatus(ids, isActive, storeId) {
   if (!Array.isArray(ids) || ids.length === 0) return Promise.resolve([]);
-  return db("products")
-    .whereIn("id", ids)
+  let query = db("products").whereIn("id", ids);
+
+  if (storeId !== undefined) {
+    query = query.where("store_id", storeId);
+  }
+
+  return query
     .update({ is_active: Boolean(isActive), updated_at: new Date() })
     .returning(["id", "name", "is_active"]);
 }
@@ -215,7 +310,54 @@ function bulkDeleteProducts(ids) {
 
 function findProductsByIds(ids) {
   if (!Array.isArray(ids) || ids.length === 0) return Promise.resolve([]);
-  return db("products").whereIn("id", ids).select(["id", "name", "images", "image_keys"]);
+  return db("products")
+    .whereIn("products.id", ids)
+    .select([
+      "products.id",
+      "products.name",
+      "products.images",
+      "products.image_keys",
+      "products.store_id",
+    ]);
+}
+
+async function getProductStats({ storeId, includeAdmin = false, adminOnly = false } = {}) {
+  let baseQuery = db("products");
+
+  if (adminOnly) {
+    baseQuery = baseQuery.whereNull("products.store_id");
+  } else if (storeId !== undefined) {
+    if (includeAdmin) {
+      baseQuery = baseQuery.where(function () {
+        this.where("products.store_id", storeId).orWhereNull("products.store_id");
+      });
+    } else {
+      baseQuery = baseQuery.where({ "products.store_id": storeId });
+    }
+  }
+
+  const [productStats, categoryCount] = await Promise.all([
+    baseQuery
+      .clone()
+      .select([
+        db.raw("COUNT(*)::int as total"),
+        db.raw("COUNT(CASE WHEN is_active = true THEN 1 END)::int as active"),
+        db.raw("COUNT(CASE WHEN is_active = false THEN 1 END)::int as inactive"),
+        db.raw("COUNT(CASE WHEN stock <= 0 AND availability_type != 'MADE_TO_ORDER' THEN 1 END)::int as out_of_stock"),
+      ])
+      .first(),
+    db("categories")
+      .count("id as count")
+      .first(),
+  ]);
+
+  return {
+    total: Number(productStats?.total || 0),
+    active: Number(productStats?.active || 0),
+    inactive: Number(productStats?.inactive || 0),
+    outOfStock: Number(productStats?.out_of_stock || 0),
+    totalCategories: Number(categoryCount?.count || 0),
+  };
 }
 
 module.exports = {
@@ -224,6 +366,7 @@ module.exports = {
   findProductsByIds,
   countProducts,
   countProductsByCategory,
+  getProductStats,
   createProduct,
   updateProduct,
   deleteProduct,
@@ -233,4 +376,3 @@ module.exports = {
   attachOffersToProducts,
   getApplicableOffersForProduct,
 };
-

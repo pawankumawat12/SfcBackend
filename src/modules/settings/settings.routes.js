@@ -1,5 +1,5 @@
 const express = require("express");
-const { verifyToken, isAdmin } = require("../../../middleware/auth.middleware");
+const { verifyToken, isAdmin, isAdminOrStoreOwner } = require("../../../middleware/auth.middleware");
 const { uploadImage } = require("../../../middleware/upload");
 const {
   getTheme,
@@ -40,6 +40,10 @@ router.put("/logo", verifyToken, isAdmin, uploadImage.single("logo"), updateLogo
 router.get("/order-pricing", getOrderPricing);
 router.put("/order-pricing", verifyToken, isAdmin, updateOrderPricing);
 
+// Developer Attribution & Inquiries Settings
+router.get("/developer", getDeveloper);
+router.put("/developer", verifyToken, isAdmin, updateDeveloper);
+
 // Resend Email Settings
 router.get("/email", verifyToken, isAdmin, getResend);
 router.put("/email", verifyToken, isAdmin, updateResend);
@@ -54,6 +58,11 @@ router.put("/payment", verifyToken, isAdmin, updatePayment);
 // Backwards-compatible SMTP aliases
 router.get("/smtp", verifyToken, isAdmin, getSmtp);
 router.put("/smtp", verifyToken, isAdmin, updateSmtp);
-router.post("/smtp/test", verifyToken, isAdmin, testSmtp);
+// Dynamic QR Code Settings
+router.get("/qr/destination", getPublicQrDestination);
+router.get("/qr/redirect", handleQrRedirect);
+router.get("/qr", verifyToken, isAdminOrStoreOwner, getDynamicQr);
+router.put("/qr", verifyToken, isAdmin, updateDynamicQr);
+router.get("/qr/download", verifyToken, isAdminOrStoreOwner, downloadDynamicQr);
 
 module.exports = router;

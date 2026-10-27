@@ -1,13 +1,41 @@
 const db = require("../../config/db");
 
+let inventoryStoreColumnsChecked = false;
+async function ensureInventoryStoreColumns() {
+  if (inventoryStoreColumnsChecked) return;
+  try {
+    await db.raw(`
+      ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS store_id INTEGER;
+      ALTER TABLE ingredients ADD COLUMN IF NOT EXISTS store_id INTEGER;
+      ALTER TABLE product_ingredients ADD COLUMN IF NOT EXISTS store_id INTEGER;
+      ALTER TABLE ingredient_stock_logs ADD COLUMN IF NOT EXISTS store_id INTEGER;
+    `);
+    inventoryStoreColumnsChecked = true;
+  } catch (err) {
+    console.warn("[Inventory Model] Schema self-heal notice:", err.message);
+  }
+}
+
 /**
  * ============================================================================
  * SUPPLIERS
  * ============================================================================
  */
 
-async function getAllSuppliers({ search, status, page = 1, limit = 50 } = {}) {
+async function getAllSuppliers({ search, status, storeId, page = 1, limit = 50 } = {}) {
+  await ensureInventoryStoreColumns();
   let query = db("suppliers").select("*");
+
+  if (storeId !== undefined) {
+    if (storeId === null) {
+      query = query.whereNull("store_id");
+    } else {
+      // Store owners see suppliers assigned to their store as well as global suppliers
+      query = query.where((builder) => {
+        builder.where("store_id", storeId).orWhereNull("store_id");
+      });
+    }
+  }
 
   if (search) {
     const term = `%${search.trim()}%`;
@@ -46,13 +74,22 @@ async function getAllSuppliers({ search, status, page = 1, limit = 50 } = {}) {
   };
 }
 
-async function getSupplierById(id) {
-  const supplier = await db("suppliers").where({ id }).first();
+async function getSupplierById(id, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let query = db("suppliers").where({ id });
+  if (storeId !== undefined && storeId !== null) {
+    query = query.where((b) => b.where("store_id", storeId).orWhereNull("store_id"));
+  }
+  const supplier = await query.first();
   if (!supplier) return null;
 
-  const ingredients = await db("ingredients")
-    .where({ supplier_id: id })
-    .select("id", "name", "category", "base_unit", "current_stock", "purchase_price", "is_active")
+  let ingQuery = db("ingredients").where({ supplier_id: id });
+  if (storeId !== undefined && storeId !== null) {
+    ingQuery = ingQuery.where({ store_id: storeId });
+  }
+
+  const ingredients = await ingQuery
+    .select("id", "name", "category", "base_unit", "current_stock", "purchase_price", "is_active", "store_id")
     .orderBy("name", "asc");
 
   return {
@@ -61,7 +98,8 @@ async function getSupplierById(id) {
   };
 }
 
-async function createSupplier(data) {
+async function createSupplier(data, storeId = null) {
+  await ensureInventoryStoreColumns();
   const [created] = await db("suppliers")
     .insert({
       name: data.name.trim(),
@@ -71,13 +109,22 @@ async function createSupplier(data) {
       address: data.address?.trim() || null,
       gstin: data.gstin?.trim() || null,
       notes: data.notes?.trim() || null,
+      store_id: storeId || data.store_id || null,
       is_active: data.is_active !== undefined ? Boolean(data.is_active) : true,
     })
     .returning("*");
   return created;
 }
 
-async function updateSupplier(id, data) {
+async function updateSupplier(id, data, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let query = db("suppliers").where({ id });
+  if (storeId !== undefined && storeId !== null) {
+    query = query.where({ store_id: storeId });
+  }
+  const existing = await query.first();
+  if (!existing) return null;
+
   const payload = {};
   if (data.name !== undefined) payload.name = data.name.trim();
   if (data.contact_person !== undefined) payload.contact_person = data.contact_person?.trim() || null;
@@ -93,8 +140,13 @@ async function updateSupplier(id, data) {
   return updated;
 }
 
-async function deleteSupplier(id) {
-  return db("suppliers").where({ id }).del();
+async function deleteSupplier(id, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let query = db("suppliers").where({ id });
+  if (storeId !== undefined && storeId !== null) {
+    query = query.where({ store_id: storeId });
+  }
+  return query.del();
 }
 
 /**
@@ -109,9 +161,11 @@ async function getAllIngredients({
   status,
   stockStatus,
   supplierId,
+  storeId,
   page = 1,
   limit = 50,
 } = {}) {
+  await ensureInventoryStoreColumns();
   let query = db("ingredients as i")
     .leftJoin("suppliers as s", "i.supplier_id", "s.id")
     .select(
@@ -119,6 +173,14 @@ async function getAllIngredients({
       "s.name as supplier_name",
       "s.phone as supplier_phone"
     );
+
+  if (storeId !== undefined) {
+    if (storeId === null) {
+      query = query.whereNull("i.store_id");
+    } else {
+      query = query.where("i.store_id", storeId);
+    }
+  }
 
   if (search) {
     const term = `%${search.trim()}%`;
@@ -156,6 +218,30 @@ async function getAllIngredients({
   const totalResult = await countQuery;
   const total = Number(totalResult?.total || 0);
 
+  // Compute summary metrics across all records matching current filter (not just the current page)
+  let statsResult = null;
+  try {
+    const statsQuery = query
+      .clone()
+      .clearSelect()
+      .select(
+        db.raw("COUNT(DISTINCT i.id) as total_items"),
+        db.raw(
+          "COUNT(DISTINCT CASE WHEN i.current_stock <= i.min_stock_threshold AND i.current_stock > 0 THEN i.id END) as low_stock_count"
+        ),
+        db.raw(
+          "COUNT(DISTINCT CASE WHEN i.current_stock <= 0 THEN i.id END) as out_of_stock_count"
+        ),
+        db.raw(
+          "COALESCE(SUM(i.current_stock * i.purchase_price), 0) as total_stock_value"
+        )
+      )
+      .first();
+    statsResult = await statsQuery;
+  } catch (err) {
+    console.warn("[Inventory Model] Stats query warning:", err.message);
+  }
+
   const offset = (Math.max(1, Number(page)) - 1) * Number(limit);
   const data = await query
     .orderBy("i.name", "asc")
@@ -178,30 +264,49 @@ async function getAllIngredients({
       limit: Number(limit),
       totalPages: Math.ceil(total / Number(limit)) || 1,
     },
+    summary: {
+      totalItems: Number(statsResult?.total_items || total),
+      lowStockCount: Number(statsResult?.low_stock_count || 0),
+      outOfStockCount: Number(statsResult?.out_of_stock_count || 0),
+      totalStockValue: Number(statsResult?.total_stock_value || 0),
+    },
   };
 }
 
-async function getIngredientById(id) {
-  const item = await db("ingredients as i")
+async function getIngredientById(id, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let query = db("ingredients as i")
     .leftJoin("suppliers as s", "i.supplier_id", "s.id")
     .select("i.*", "s.name as supplier_name", "s.phone as supplier_phone")
-    .where("i.id", id)
-    .first();
+    .where("i.id", id);
 
+  if (storeId !== undefined && storeId !== null) {
+    query = query.where("i.store_id", storeId);
+  }
+
+  const item = await query.first();
   if (!item) return null;
 
   // Fetch recent stock movement logs
-  const recentLogs = await db("ingredient_stock_logs as l")
+  let logQuery = db("ingredient_stock_logs as l")
     .leftJoin("users as u", "l.created_by", "u.id")
-    .where("l.ingredient_id", id)
+    .where("l.ingredient_id", id);
+  if (storeId !== undefined && storeId !== null) {
+    logQuery = logQuery.where("l.store_id", storeId);
+  }
+  const recentLogs = await logQuery
     .select("l.*", "u.name as user_name", "u.email as user_email")
     .orderBy("l.created_at", "desc")
     .limit(20);
 
   // Fetch products using this ingredient
-  const usedInProducts = await db("product_ingredients as pi")
+  let prodQuery = db("product_ingredients as pi")
     .join("products as p", "pi.product_id", "p.id")
-    .where("pi.ingredient_id", id)
+    .where("pi.ingredient_id", id);
+  if (storeId !== undefined && storeId !== null) {
+    prodQuery = prodQuery.where("p.store_id", storeId);
+  }
+  const usedInProducts = await prodQuery
     .select("p.id", "p.name", "p.price", "pi.quantity", "pi.unit");
 
   return {
@@ -217,10 +322,12 @@ async function getIngredientById(id) {
   };
 }
 
-async function createIngredient(data, userId = null) {
+async function createIngredient(data, userId = null, storeId = null) {
+  await ensureInventoryStoreColumns();
   return db.transaction(async (trx) => {
     const initialStock = Number(data.current_stock || 0);
     const minThreshold = Number(data.min_stock_threshold || 0);
+    const targetStoreId = storeId || data.store_id || null;
 
     const [created] = await trx("ingredients")
       .insert({
@@ -238,6 +345,7 @@ async function createIngredient(data, userId = null) {
         low_stock_notified: initialStock <= minThreshold && initialStock > 0,
         batch_number: data.batch_number?.trim() || null,
         expiry_date: data.expiry_date || null,
+        store_id: targetStoreId,
         is_active: data.is_active !== undefined ? Boolean(data.is_active) : true,
       })
       .returning("*");
@@ -253,6 +361,7 @@ async function createIngredient(data, userId = null) {
         cost_per_unit: Number(data.purchase_price || 0),
         reason: "Initial stock upon ingredient creation",
         created_by: userId ? Number(userId) : null,
+        store_id: targetStoreId,
       });
     }
 
@@ -260,7 +369,15 @@ async function createIngredient(data, userId = null) {
   });
 }
 
-async function updateIngredient(id, data) {
+async function updateIngredient(id, data, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let check = db("ingredients").where({ id });
+  if (storeId !== undefined && storeId !== null) {
+    check = check.where({ store_id: storeId });
+  }
+  const existing = await check.first();
+  if (!existing) return null;
+
   const payload = {};
   if (data.name !== undefined) payload.name = data.name.trim();
   if (data.supplier_id !== undefined)
@@ -283,9 +400,14 @@ async function updateIngredient(id, data) {
   return updated;
 }
 
-async function adjustIngredientStock(id, { adjustmentType, quantity, costPerUnit, reason, userId }) {
+async function adjustIngredientStock(id, { adjustmentType, quantity, costPerUnit, reason, userId, storeId }) {
+  await ensureInventoryStoreColumns();
   return db.transaction(async (trx) => {
-    const item = await trx("ingredients").where({ id }).forUpdate().first();
+    let check = trx("ingredients").where({ id }).forUpdate();
+    if (storeId !== undefined && storeId !== null) {
+      check = check.where({ store_id: storeId });
+    }
+    const item = await check.first();
     if (!item) {
       throw new Error("Ingredient not found");
     }
@@ -310,7 +432,6 @@ async function adjustIngredientStock(id, { adjustmentType, quantity, costPerUnit
       delta = -qty;
       changeType = "MANUAL_ADJUSTMENT";
     } else {
-      // Default manual adjustment
       delta = qty;
     }
 
@@ -341,6 +462,7 @@ async function adjustIngredientStock(id, { adjustmentType, quantity, costPerUnit
       cost_per_unit: costPerUnit !== undefined && costPerUnit !== null ? Number(costPerUnit) : Number(item.purchase_price),
       reason: reason?.trim() || `Manual stock adjustment (${changeType})`,
       created_by: userId ? Number(userId) : null,
+      store_id: item.store_id || null,
     });
 
     return {
@@ -353,7 +475,17 @@ async function adjustIngredientStock(id, { adjustmentType, quantity, costPerUnit
   });
 }
 
-async function deleteIngredient(id) {
+async function deleteIngredient(id, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let check = db("ingredients").where({ id });
+  if (storeId !== undefined && storeId !== null) {
+    check = check.where({ store_id: storeId });
+  }
+  const item = await check.first();
+  if (!item) {
+    throw new Error("Ingredient not found");
+  }
+
   // Check if ingredient is used in any product recipes
   const usage = await db("product_ingredients").where({ ingredient_id: id }).first();
   if (usage) {
@@ -370,18 +502,25 @@ async function deleteIngredient(id) {
  * ============================================================================
  */
 
-async function getRecipeForProduct(productId) {
-  const product = await db("products")
+async function getRecipeForProduct(productId, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let prodQuery = db("products")
     .where({ id: productId })
-    .select("id", "name", "price", "category_id")
-    .first();
+    .select("id", "name", "price", "category_id", "store_id");
 
+  if (storeId !== undefined && storeId !== null) {
+    prodQuery = prodQuery.where({ store_id: storeId });
+  }
+
+  const product = await prodQuery.first();
   if (!product) return null;
 
-  const items = await db("product_ingredients as pi")
+  let itemQuery = db("product_ingredients as pi")
     .join("ingredients as i", "pi.ingredient_id", "i.id")
     .leftJoin("suppliers as s", "i.supplier_id", "s.id")
-    .where("pi.product_id", productId)
+    .where("pi.product_id", productId);
+
+  const items = await itemQuery
     .select(
       "pi.id as recipe_item_id",
       "pi.ingredient_id",
@@ -438,11 +577,32 @@ async function getRecipeForProduct(productId) {
   };
 }
 
-async function saveProductRecipe(productId, ingredientsList = []) {
+async function saveProductRecipe(productId, ingredientsList = [], storeId = undefined) {
+  await ensureInventoryStoreColumns();
   return db.transaction(async (trx) => {
-    const product = await trx("products").where({ id: productId }).first();
+    let prodQuery = trx("products").where({ id: productId });
+    if (storeId !== undefined && storeId !== null) {
+      prodQuery = prodQuery.where({ store_id: storeId });
+    }
+    const product = await prodQuery.first();
     if (!product) {
-      throw new Error("Product not found");
+      throw new Error("Product not found or you do not have permission to manage this product recipe");
+    }
+
+    // If storeId is provided, verify that all selected ingredients belong to this store
+    if (storeId !== undefined && storeId !== null && ingredientsList.length > 0) {
+      const ingIds = ingredientsList.map((item) => Number(item.ingredient_id));
+      const invalidIngredients = await trx("ingredients")
+        .whereIn("id", ingIds)
+        .where(function () {
+          this.whereNull("store_id").orWhere("store_id", "!=", storeId);
+        });
+
+      if (invalidIngredients.length > 0) {
+        throw new Error(
+          "Store owners can only add raw materials belonging to their own store to this recipe."
+        );
+      }
     }
 
     // Remove existing recipe ingredients for this product
@@ -454,16 +614,24 @@ async function saveProductRecipe(productId, ingredientsList = []) {
         ingredient_id: Number(item.ingredient_id),
         quantity: Number(item.quantity),
         unit: item.unit?.trim() || null,
+        store_id: product.store_id || null,
       }));
 
       await trx("product_ingredients").insert(rowsToInsert);
     }
 
-    return getRecipeForProduct(productId);
+    return getRecipeForProduct(productId, storeId);
   });
 }
 
-async function deleteProductIngredient(productId, ingredientId) {
+async function deleteProductIngredient(productId, ingredientId, storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  if (storeId !== undefined && storeId !== null) {
+    const product = await db("products").where({ id: productId, store_id: storeId }).first();
+    if (!product) {
+      throw new Error("Product not found or unauthorized");
+    }
+  }
   return db("product_ingredients")
     .where({ product_id: productId, ingredient_id: ingredientId })
     .del();
@@ -479,9 +647,11 @@ async function getStockLogs({
   ingredientId,
   orderId,
   changeType,
+  storeId,
   page = 1,
   limit = 50,
 } = {}) {
+  await ensureInventoryStoreColumns();
   let query = db("ingredient_stock_logs as l")
     .join("ingredients as i", "l.ingredient_id", "i.id")
     .leftJoin("orders as o", "l.order_id", "o.id")
@@ -496,6 +666,14 @@ async function getStockLogs({
       "u.email as user_email",
       "o.status as order_status"
     );
+
+  if (storeId !== undefined) {
+    if (storeId === null) {
+      query = query.whereNull("l.store_id");
+    } else {
+      query = query.where("l.store_id", storeId);
+    }
+  }
 
   if (ingredientId) {
     query = query.where("l.ingredient_id", ingredientId);
@@ -542,11 +720,18 @@ async function getStockLogs({
  * ============================================================================
  */
 
-async function getLowStockIngredients() {
-  const data = await db("ingredients as i")
+async function getLowStockIngredients(storeId = undefined) {
+  await ensureInventoryStoreColumns();
+  let query = db("ingredients as i")
     .leftJoin("suppliers as s", "i.supplier_id", "s.id")
     .where("i.is_active", true)
-    .whereRaw("i.current_stock <= i.min_stock_threshold")
+    .whereRaw("i.current_stock <= i.min_stock_threshold");
+
+  if (storeId !== undefined && storeId !== null) {
+    query = query.where("i.store_id", storeId);
+  }
+
+  const data = await query
     .select(
       "i.*",
       "s.name as supplier_name",

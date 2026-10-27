@@ -1,5 +1,5 @@
 const express = require("express");
-const { verifyToken, isAdmin } = require("../../../middleware/auth.middleware");
+const { verifyToken, isAdmin, optionalToken } = require("../../../middleware/auth.middleware");
 const {
   listCategories,
   getCategoryById,
@@ -13,7 +13,7 @@ const { uploadImage } = require("../../../middleware/upload");
 
 const router = express.Router();
 
-router.get("/",  listCategories);
+router.get("/", optionalToken, listCategories);
 router.post("/bulk-status", verifyToken, isAdmin, bulkUpdateCategoryStatusHandler);
 router.post("/bulk-delete", verifyToken, isAdmin, bulkDeleteCategoriesHandler);
 router.get("/:id", getCategoryById);

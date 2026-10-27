@@ -17,7 +17,7 @@ function parseJsonArray(val) {
 function roundCurrency(val) {
   const num = Number(val);
   if (isNaN(num) || !isFinite(num)) return 0;
-  return Math.round((num + Number.EPSILON) * 100) / 100;
+  return Math.round(num);
 }
 
 function normalizeOffer(row) {

@@ -1,4 +1,12 @@
 const DashboardModel = require("../../models/dashboard.model");
+const db = require("../../../config/db");
+
+async function getStoreIdForUser(user) {
+  if (!user) return null;
+  if (user.store_id) return user.store_id;
+  const store = await db("stores").where({ owner_id: user.id }).first();
+  return store ? store.id : null;
+}
 
 /**
  * Get comprehensive overview dashboard metrics
@@ -6,6 +14,11 @@ const DashboardModel = require("../../models/dashboard.model");
 async function getDashboardOverview(req, res) {
   try {
     const timeframe = req.query.timeframe || "weekly";
+    let storeId = null;
+
+    if (req.user.role === "store_owner") {
+      storeId = await getStoreIdForUser(req.user);
+    }
 
     const [
       kpis,
@@ -16,13 +29,13 @@ async function getDashboardOverview(req, res) {
       recentOrders,
       recentActivities,
     ] = await Promise.all([
-      DashboardModel.getKpis(),
-      DashboardModel.getRevenueAndOrderTrends(timeframe),
-      DashboardModel.getOrderStatusDistribution(),
-      DashboardModel.getTopSellingProducts(5),
-      DashboardModel.getCategorySalesDistribution(),
-      DashboardModel.getRecentOrders(6),
-      DashboardModel.getRecentActivities(6),
+      DashboardModel.getKpis(storeId, timeframe),
+      DashboardModel.getRevenueAndOrderTrends(timeframe, storeId),
+      DashboardModel.getOrderStatusDistribution(storeId, timeframe),
+      DashboardModel.getTopSellingProducts(5, storeId, timeframe),
+      DashboardModel.getCategorySalesDistribution(storeId, timeframe),
+      DashboardModel.getRecentOrders(6, storeId),
+      DashboardModel.getRecentActivities(6, storeId),
     ]);
 
     return res.status(200).json({
@@ -53,7 +66,13 @@ async function getDashboardOverview(req, res) {
 async function getDashboardTrends(req, res) {
   try {
     const timeframe = req.query.timeframe || "weekly";
-    const trends = await DashboardModel.getRevenueAndOrderTrends(timeframe);
+    let storeId = null;
+
+    if (req.user.role === "store_owner") {
+      storeId = await getStoreIdForUser(req.user);
+    }
+
+    const trends = await DashboardModel.getRevenueAndOrderTrends(timeframe, storeId);
 
     return res.status(200).json({
       success: true,

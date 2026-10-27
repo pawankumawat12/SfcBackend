@@ -1,3 +1,8 @@
+const {
+  normalizeIndianPhone,
+  isValidIndianPhone,
+} = require("../../utils/phone.util");
+
 function validateEmail(email) {
   const emailRegex =
     /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
@@ -5,8 +10,7 @@ function validateEmail(email) {
 }
 
 function validatePhone(phone) {
-  if (typeof phone !== "string") return false;
-  return /^[6-9]\d{9}$/.test(phone);
+  return isValidIndianPhone(phone);
 }
 
 function validatePassword(password) {
@@ -25,19 +29,15 @@ function validateRegister({ name, email, phone, password }) {
   }
 
   const hasEmail = typeof email === "string" && email.trim() !== "";
-  const hasPhone = typeof phone === "string" && phone.trim() !== "";
-
-  if (!hasEmail && !hasPhone) {
-    errors.email = "Either email or phone number is required.";
-    errors.phone = "Either email or phone number is required.";
-  }
-
-  if (hasEmail && !validateEmail(email.trim())) {
+  if (!hasEmail || !validateEmail(email.trim())) {
     errors.email = "A valid email address is required.";
   }
 
-  if (hasPhone && !validatePhone(phone.trim())) {
-    errors.phone = "A valid 10-digit phone number is required.";
+  const hasPhone = typeof phone === "string" && phone.trim() !== "";
+  if (!hasPhone) {
+    errors.phone = "Mobile number is required.";
+  } else if (!validatePhone(phone.trim())) {
+    errors.phone = "A valid 10-digit mobile number (starting with 6-9) is required.";
   }
 
   if (!password || !validatePassword(password)) {
@@ -111,4 +111,7 @@ module.exports = {
   validateUpdateProfile,
   validateEmail,
   validatePhone,
+  normalizePhone: normalizeIndianPhone,
+  normalizeIndianPhone,
+  isValidIndianPhone,
 };

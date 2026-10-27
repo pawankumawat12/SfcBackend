@@ -15,6 +15,7 @@ const generateAccessToken = (user) => {
     {
       id: user.id,
       role: user.role,
+      store_id: user.store_id || null,
     },
     ACCESS_SECRET,
     {

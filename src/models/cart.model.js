@@ -18,10 +18,17 @@ function getCartItems(userId) {
       "products.images",
       "products.is_active",
       "products.category_id",
+      "products.store_id",
       "categories.name as category_name",
+      // Store closure info
+      // Store closure & active status info
+      "stores.name as store_name",
+      "stores.is_open as store_is_open",
+      "stores.is_active as store_is_active",
     ])
     .join("products", "cart_items.product_id", "products.id")
     .leftJoin("categories", "products.category_id", "categories.id")
+    .leftJoin("stores", "products.store_id", "stores.id")
     .where("cart_items.user_id", userId)
     .orderBy("cart_items.updated_at", "desc");
 }

@@ -10,8 +10,17 @@ const {
   updateOrderPaymentStatus,
   acceptOrder,
   rejectOrder,
+  forwardOrderToStore,
+  ensureOrderStoreColumns,
 } = require("../../models/order.model");
 const Crypto = require("crypto");
+
+async function getStoreIdForUser(user) {
+  if (!user) return null;
+  if (user.store_id) return user.store_id;
+  const store = await db("stores").where({ owner_id: user.id }).first();
+  return store ? store.id : null;
+}
 
 const Address = require("../../models/address.model");
 const notificationModel = require("../../models/notification.model");
@@ -27,11 +36,13 @@ const {
   verifyPaymentSignature,
 } = require("../../services/razorpayService");
 const { finalizePaidOrder, handleRefundProcessed } = require("../../services/orderPayment.service");
+const { normalizeIndianPhone, isValidIndianPhone } = require("../../utils/phone.util");
 const db = require("../../../config/db");
 const { incrementOfferUsage } = require("../../models/offer.model");
 const { generateInvoicePdf } = require("../../services/invoice.service");
 const { getStoreStatusSettings } = require("../../models/settings.model");
 const { roundCurrency } = require("../../utils/pricing.util");
+const { deductIngredientStockForOrder, restoreIngredientStockForOrder } = require("../../services/inventory.service");
 
 async function createOrder(req, res) {
   try {
@@ -102,20 +113,6 @@ async function createOrder(req, res) {
       inputName ||
       req.user.name ||
       "Customer";
-
-    // Helper for Indian 10-digit phone normalization & validation (/^[6-9]\d{9}$/)
-    const normalizeIndianPhone = (raw) => {
-      if (!raw) return "";
-      let digits = String(raw).replace(/\D/g, "");
-      if (digits.length === 12 && digits.startsWith("91")) {
-        digits = digits.slice(2);
-      }
-      if (digits.length === 11 && digits.startsWith("0")) {
-        digits = digits.slice(1);
-      }
-      return digits;
-    };
-    const isValidIndianPhone = (val) => /^[6-9]\d{9}$/.test(val);
 
     let savedAddressData = null;
     if (addressId) {
@@ -373,74 +370,80 @@ async function createOrder(req, res) {
     // 9. ADMIN NOTIFICATION
     await notificationModel.createNotification({
       role: "admin",
-
       type: "order_created",
-
-      title:
-        `New ${paymentMethod} Order: #${order.order_number || order.id
-        }`,
-
-      message:
-        `${finalCustomerName} placed a ${paymentMethod} order worth ₹${order.total_amount}.`,
-
-      orderId:
-        order.id,
-
+      title: `New ${paymentMethod} Order: #${order.order_number || order.id}`,
+      message: `${finalCustomerName} placed a ${paymentMethod} order worth ₹${order.total_amount}.`,
+      orderId: order.id,
       dataJson: {
-        orderId:
-          order.id,
-
-        orderNumber:
-          order.order_number ||
-          `#SFC-${order.id}`,
-
-        customerName:
-          finalCustomerName,
-
-        totalAmount:
-          order.total_amount,
-
+        orderId: order.id,
+        orderNumber: order.order_number || `#SFC-${order.id}`,
+        customerName: finalCustomerName,
+        totalAmount: order.total_amount,
         paymentMethod,
-
-        paymentStatus:
-          order.payment_status,
-
-        orderStatus:
-          order.status,
+        paymentStatus: order.payment_status,
+        orderStatus: order.status,
       },
     });
 
-    // 10. SOCKET.IO ADMIN EVENT
+    const isCod =
+      String(paymentMethod).trim().toLowerCase() === "cash on delivery" ||
+      String(paymentMethod).trim().toLowerCase() === "cod";
 
+    // 9b. STORE OWNER NOTIFICATION (only if COD and order is auto-forwarded to a store; Online orders notify after payment verification)
+    if (isCod && order.store_id) {
+      try {
+        const store = await db("stores").where({ id: order.store_id }).first();
+        if (store && (store.auto_forward_orders || order.is_forwarded_to_store) && store.owner_id) {
+          await notificationModel.createNotification({
+            userId: store.owner_id,
+            role: "store_owner",
+            storeId: store.id,
+            type: "order_created",
+            title: `New ${paymentMethod} Order: #${order.order_number || order.id}`,
+            message: `${finalCustomerName} placed a ${paymentMethod} order worth ₹${order.total_amount}.`,
+            orderId: order.id,
+            dataJson: {
+              orderId: order.id,
+              orderNumber: order.order_number || `#SFC-${order.id}`,
+              customerName: finalCustomerName,
+              totalAmount: order.total_amount,
+              paymentMethod,
+              paymentStatus: order.payment_status,
+              orderStatus: order.status,
+            },
+          });
+          emitToUser(store.owner_id, "new_order", {
+            order,
+            message: `New order #${order.order_number || order.id} assigned to your store!`,
+          });
+        }
+      } catch (storeNotifErr) {
+        console.warn("[OrderController] Store owner notification error on create:", storeNotifErr.message);
+      }
+    }
+
+    // 10. SOCKET.IO ADMIN EVENT
     emitToAdmin(
       "admin_new_order",
       {
         order,
-
-        message:
-          `New ${paymentMethod} order #${order.order_number ||
-          order.id
-          } from ${finalCustomerName}`,
+        message: `New ${paymentMethod} order #${order.order_number || order.id} from ${finalCustomerName}`,
       }
     );
 
-    // 10.1 FCM PUSH NOTIFICATION TO ADMIN (Non-blocking / Decoupled)
-    try {
-      const fcmNotificationService = require("../../services/fcmNotification.service");
-      setImmediate(() => {
-        fcmNotificationService
-          .sendAdminNewOrderNotification({
-            orderId: order.id,
-            orderNumber: order.order_number || String(order.id),
-            totalAmount: order.total_amount,
-            customerName: finalCustomerName,
-          })
-          .catch((err) =>
-            console.error("[FCM Push Service Error]:", err.message)
+    if (isCod) {
+
+      // Automated WhatsApp Order Alert (Store Owner or Admin based on dispatch permission)
+      try {
+        const { sendOrderWhatsAppAlert } = require("../../services/whatsapp.service");
+        setImmediate(() => {
+          sendOrderWhatsAppAlert(order).catch((err) =>
+            console.error("[WhatsApp Order Alert Error]:", err.message)
           );
-      });
-    } catch (fcmErr) {
-      console.error("[FCM Push Service Init Error]:", fcmErr.message);
+        });
+      } catch (waErr) {
+        console.error("[WhatsApp Alert Init Error]:", waErr.message);
+      }
     }
 
     // 11. RESPONSE
@@ -661,14 +664,34 @@ async function verifyRazorpayPayment(req, res) {
     });
   }
 }
+function attachCancellationMeta(order, userRole) {
+  if (!order) return order;
+  const cancelableStatuses = ["Pending", "Order Placed", "Pending Payment"];
+  const isEligibleStatus = cancelableStatuses.includes(order.status);
+
+  return {
+    ...order,
+    cancellation: {
+      canCancel:
+        userRole === "admin"
+          ? order.status !== "Cancelled" && order.status !== "Completed" && order.status !== "Delivered"
+          : isEligibleStatus,
+      isEligibleStatus,
+    },
+  };
+}
+
 async function getUserOrders(req, res) {
   try {
     const { page, limit, status } = req.query || {};
     const result = await findOrdersByUser(req.user.id, { page, limit, status });
+    const enrichedOrders = (result.orders || []).map((o) =>
+      attachCancellationMeta(o, req.user?.role)
+    );
     return res.status(200).json({
       success: true,
       message: "Orders fetched successfully",
-      data: result.orders,
+      data: enrichedOrders,
       pagination: result.pagination,
     });
   } catch (error) {
@@ -690,7 +713,22 @@ async function getOrderDetails(req, res) {
       });
     }
 
-    const order = await findOrderById(orderId, req.user.role === "admin" ? null : req.user.id);
+    let order;
+    if (req.user.role === "admin") {
+      order = await findOrderById(orderId, null);
+    } else if (req.user.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      order = await findOrderById(orderId, null);
+      if (!order || order.store_id !== userStoreId || !order.is_forwarded_to_store) {
+        return res.status(404).json({
+          success: false,
+          message: "Order not found or not dispatched to your store.",
+        });
+      }
+    } else {
+      order = await findOrderById(orderId, req.user.id);
+    }
+
     if (!order) {
       return res.status(404).json({
         success: false,
@@ -698,10 +736,32 @@ async function getOrderDetails(req, res) {
       });
     }
 
+    const enrichedOrder = attachCancellationMeta(order, req.user?.role);
+
+    if (req.user?.role === "store_owner") {
+      enrichedOrder.customer_email = null;
+      enrichedOrder.customer_phone = null;
+      enrichedOrder.customer_name = "Customer";
+      if (enrichedOrder.delivery_address_json) {
+        try {
+          const parsed =
+            typeof enrichedOrder.delivery_address_json === "string"
+              ? JSON.parse(enrichedOrder.delivery_address_json)
+              : enrichedOrder.delivery_address_json;
+          if (parsed && typeof parsed === "object") {
+            delete parsed.phone_number;
+            enrichedOrder.delivery_address_json = parsed;
+          }
+        } catch {
+          // ignore parsing error
+        }
+      }
+    }
+
     return res.status(200).json({
       success: true,
       message: "Order details fetched successfully",
-      data: order,
+      data: enrichedOrder,
     });
   } catch (error) {
     console.error("Get order details error:", error);
@@ -714,13 +774,62 @@ async function getOrderDetails(req, res) {
 
 async function getAdminOrders(req, res) {
   try {
-    const { page, limit, status, search } = req.query;
-    const result = await findAllOrders({ page, limit, status, search });
+    const { page, limit, status, search, store_id, storeId, startDate, endDate } = req.query;
+    const rawStoreId = store_id || storeId;
+    let targetStoreId = rawStoreId ? Number(rawStoreId) : undefined;
+    let isForwardedOnly = false;
+
+    if (req.user.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (!userStoreId) {
+        return res.status(200).json({
+          success: true,
+          message: "No store assigned to this account",
+          data: [],
+          pagination: { total: 0, page: 1, limit: 20, totalPages: 1 },
+          stats: {
+            totalOrders: 0,
+            totalAmount: 0,
+            deliveredOrders: 0,
+            cancelledOrders: 0,
+            pendingOrders: 0,
+            deliveredAmount: 0,
+          },
+        });
+      }
+      targetStoreId = userStoreId;
+      isForwardedOnly = true; // Store owners ONLY see orders forwarded to their store!
+    }
+
+    const result = await findAllOrders({
+      page,
+      limit,
+      status,
+      search,
+      storeId: targetStoreId,
+      isForwardedOnly,
+      startDate,
+      endDate,
+    });
+
+    let ordersList = result.orders;
+    if (req.user.role === "store_owner") {
+      ordersList = (result.orders || []).map((order) => {
+        const sanitized = { ...order };
+        delete sanitized.customer_email;
+        delete sanitized.customer_phone;
+        sanitized.customer_name = "Customer";
+        return sanitized;
+      });
+    }
+
     return res.status(200).json({
       success: true,
       message: "Orders fetched successfully",
-      data: result.orders,
+      data: ordersList,
       pagination: result.pagination,
+      stats: result.stats,
+      summary: result.stats,
     });
   } catch (error) {
     console.error("Admin get orders error:", error);
@@ -740,6 +849,32 @@ async function updateStatus(req, res) {
         success: false,
         message: "order ID and status are required",
       });
+    }
+
+    const existing = await findOrderById(orderId, null);
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // Critical Guard: Cancelled orders are immutable
+    if (existing.status === "Cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This order has been cancelled and its status cannot be modified.",
+      });
+    }
+
+    if (req.user.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied: order does not belong to your store or is not dispatched.",
+        });
+      }
     }
 
     const updated = await updateOrderStatus(orderId, status);
@@ -769,6 +904,10 @@ async function updateStatus(req, res) {
       status,
     });
 
+    emitToAdmin("admin_order_updated", {
+      order: order || updated,
+    });
+
     return res.status(200).json({
       success: true,
       message: "Order status updated successfully",
@@ -778,7 +917,7 @@ async function updateStatus(req, res) {
     console.error("Update order status error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to update order status",
+      message: error.message || "Failed to update order status",
     });
   }
 }
@@ -788,7 +927,34 @@ async function acceptOrderController(req, res) {
     const orderId = Number(req.params.id);
     const { notes } = req.body || {};
 
+    const existing = await findOrderById(orderId, null);
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    // Critical Guard: Cancelled orders cannot be accepted
+    if (existing.status === "Cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This order was cancelled by the customer and cannot be accepted.",
+      });
+    }
+
+    if (req.user.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied: order does not belong to your store or is not dispatched.",
+        });
+      }
+    }
+
     const updated = await acceptOrder(orderId, { notes });
+    const fullOrder = await findOrderById(orderId);
 
     // Notify customer in real-time
     if (updated && updated.user_id) {
@@ -823,7 +989,7 @@ async function acceptOrderController(req, res) {
     });
 
     emitToAdmin("admin_order_updated", {
-      order: updated,
+      order: fullOrder || updated,
     });
 
     return res.status(200).json({
@@ -845,7 +1011,33 @@ async function rejectOrderController(req, res) {
     const orderId = Number(req.params.id);
     const { cancelReason = "Order rejected by store" } = req.body || {};
 
+    const existing = await findOrderById(orderId, null);
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
+    if (existing.status === "Cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This order is already cancelled.",
+      });
+    }
+
+    if (req.user.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (!existing || existing.store_id !== userStoreId || !existing.is_forwarded_to_store) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied: order does not belong to your store or is not dispatched.",
+        });
+      }
+    }
+
     const updated = await rejectOrder(orderId, { cancelReason });
+    const fullOrder = await findOrderById(orderId);
 
     // Notify customer in real-time
     if (updated && updated.user_id) {
@@ -853,7 +1045,7 @@ async function rejectOrderController(req, res) {
         userId: updated.user_id,
         role: "customer",
         type: "order_rejected",
-        title: `Order Declined ⚠️`,
+        title: "Order Declined",
         message: `Your order #${updated.order_number || updated.id} could not be accepted. Reason: ${cancelReason}`,
         orderId: updated.id,
         dataJson: { orderId: updated.id, status: "Cancelled", cancelReason },
@@ -880,7 +1072,7 @@ async function rejectOrderController(req, res) {
     });
 
     emitToAdmin("admin_order_updated", {
-      order: updated,
+      order: fullOrder || updated,
     });
 
     return res.status(200).json({
@@ -897,6 +1089,75 @@ async function rejectOrderController(req, res) {
   }
 }
 
+async function forwardOrderToStoreHandler(req, res) {
+  try {
+    const orderId = Number(req.params.id);
+    const { store_id } = req.body || {};
+
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: "Valid Order ID is required." });
+    }
+
+    const updated = await forwardOrderToStore(orderId, store_id ? Number(store_id) : null);
+
+    // Notify Store Owner in real-time
+    if (updated && updated.store_id) {
+      try {
+        const store = await db("stores").where({ id: updated.store_id }).first();
+        if (store && store.owner_id) {
+          await notificationModel.createNotification({
+            userId: store.owner_id,
+            role: "store_owner",
+            storeId: updated.store_id,
+            type: "order_forwarded",
+            title: `New Store Order Dispatched! 📦`,
+            message: `Order #${updated.order_number || updated.id} has been dispatched to your store.`,
+            orderId: updated.id,
+            dataJson: { orderId: updated.id, orderNumber: updated.order_number },
+          });
+
+          emitToUser(store.owner_id, "new_store_order", {
+            order: updated,
+            message: `New order #${updated.order_number || updated.id} dispatched to your store!`,
+          });
+          emitToUser(store.owner_id, "new_order", {
+            order: updated,
+            message: `New order #${updated.order_number || updated.id} dispatched to your store!`,
+          });
+        }
+      } catch (notifyErr) {
+        console.warn("Notification error when forwarding to store:", notifyErr.message);
+      }
+    }
+
+    emitToAdmin("admin_order_updated", { order: updated });
+
+    // Automated WhatsApp alert to Store Owner on order dispatch
+    try {
+      const { sendOrderWhatsAppAlert } = require("../../services/whatsapp.service");
+      setImmediate(() => {
+        sendOrderWhatsAppAlert(updated).catch((err) =>
+          console.error("[WhatsApp Forward Order Alert Error]:", err.message)
+        );
+      });
+    } catch (waErr) {
+      console.error("[WhatsApp Forward Alert Init Error]:", waErr.message);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Order #${updated.order_number || updated.id} forwarded to store successfully.`,
+      data: updated,
+    });
+  } catch (error) {
+    console.error("Forward order to store error:", error);
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || "Failed to forward order to store.",
+    });
+  }
+}
+
 async function markItemProduced(req, res) {
   try {
     const itemId = Number(req.params.itemId);
@@ -908,7 +1169,24 @@ async function markItemProduced(req, res) {
       });
     }
 
+    if (req.user.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      const item = await db("order_items").where({ id: itemId }).first();
+      if (!item || (item.store_id && item.store_id !== userStoreId)) {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied: item does not belong to your store.",
+        });
+      }
+    }
+
     const updated = await updateItemProductionStatus(itemId, productionStatus);
+    const item = await db("order_items").where({ id: itemId }).first();
+    if (item?.order_id) {
+      const fullOrder = await findOrderById(item.order_id);
+      emitToAdmin("admin_order_updated", { order: fullOrder, orderId: item.order_id });
+    }
+
     return res.status(200).json({
       success: true,
       message: "Item production status updated successfully",
@@ -926,37 +1204,135 @@ async function markItemProduced(req, res) {
 async function cancelUserOrder(req, res) {
   try {
     const orderId = Number(req.params.id);
-    const { cancelReason } = req.body;
+    const { cancelReason = "Cancelled by customer within grace window" } = req.body || {};
 
     if (!orderId) {
       return res.status(400).json({ success: false, message: "Invalid order ID" });
     }
-    if (!cancelReason) {
-      return res.status(400).json({ success: false, message: "Cancel reason is required" });
+
+    const existingOrder = await db("orders").where({ id: orderId }).first();
+    if (!existingOrder) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const isAdminUser = req.user.role === "admin";
+    if (!isAdminUser && Number(existingOrder.user_id) !== Number(req.user.id)) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not authorized to cancel this order",
+      });
+    }
+
+    // 1. Status eligibility check: Only Pending or Order Placed orders (not yet accepted/in processing) can be cancelled by customer
+    const cancelableStatuses = ["Pending", "Order Placed", "Pending Payment"];
+    if (!isAdminUser && !cancelableStatuses.includes(existingOrder.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Order cannot be cancelled because it is already in processing (${existingOrder.status}).`,
+      });
     }
 
     const updated = await cancelOrder(orderId, cancelReason);
+
+    // 2. If customer paid online via Razorpay, auto-initiate full refund
+    let refundInfo = null;
+    if (existingOrder.payment_status === "Paid" && existingOrder.payment_id) {
+      try {
+        const totalAmount = Number(existingOrder.total || existingOrder.grand_total);
+        const refundRes = await initiateRazorpayRefund({
+          paymentId: existingOrder.payment_id || existingOrder.transaction_id,
+          amount: totalAmount,
+          notes: {
+            reason: `Customer cancelled order #${existingOrder.order_number || existingOrder.id}`,
+          },
+        });
+        refundInfo = refundRes;
+        await handleRefundProcessed(existingOrder.id, refundRes.id, totalAmount);
+      } catch (rfErr) {
+        console.warn("[Cancel Order] Automatic online refund notice:", rfErr.message);
+      }
+    }
 
     // Notify Admin
     await notificationModel.createNotification({
       role: "admin",
       type: "order_status",
       title: `Order Cancelled by Customer: #${updated.order_number || updated.id}`,
-      message: `Customer cancelled order. Reason: ${cancelReason}`,
+      message: `Customer cancelled order before processing. Reason: ${cancelReason}`,
       orderId: updated.id,
       dataJson: { orderId: updated.id, cancelReason },
     });
 
+    // Real-time broadcast to Admin & Store Owners
     emitToAdmin("admin_order_cancelled", {
       orderId: updated.id,
       orderNumber: updated.order_number || `#SFC-${updated.id}`,
       cancelReason,
+      order: updated,
+    });
+
+    emitToAdmin("admin_order_updated", {
+      order: updated,
+      orderId: updated.id,
+      status: "Cancelled",
+    });
+
+    emitToAdmin("admin_order_status_updated", {
+      orderId: updated.id,
+      orderNumber: updated.order_number || `#SFC-${updated.id}`,
+      status: "Cancelled",
+      order: updated,
+    });
+
+    // If order is dispatched to a store, ensure store owner's personal room receives the live cancellation
+    if (existingOrder.store_id && existingOrder.is_forwarded_to_store) {
+      try {
+        const storeRecord = await db("stores").where({ id: existingOrder.store_id }).first();
+        if (storeRecord && storeRecord.owner_id) {
+          emitToUser(storeRecord.owner_id, "admin_order_cancelled", {
+            orderId: updated.id,
+            orderNumber: updated.order_number || `#SFC-${updated.id}`,
+            cancelReason,
+            order: updated,
+          });
+          emitToUser(storeRecord.owner_id, "admin_order_updated", {
+            order: updated,
+            orderId: updated.id,
+            status: "Cancelled",
+          });
+        }
+      } catch (storeNotifyErr) {
+        console.warn("[Cancel Order] Store owner notify error:", storeNotifyErr.message);
+      }
+    }
+
+    // Real-time live update to customer
+    emitToUser(existingOrder.user_id, "order_status_updated", {
+      orderId: updated.id,
+      orderNumber: updated.order_number || `#SFC-${updated.id}`,
+      status: "Cancelled",
+      order: updated,
+    });
+
+    emitToUser(existingOrder.user_id, "order_cancelled", {
+      orderId: updated.id,
+      orderNumber: updated.order_number || `#SFC-${updated.id}`,
+      status: "Cancelled",
+      cancelReason,
+      order: updated,
+    });
+
+    emitToOrder(updated.id, "order_status_updated", {
+      orderId: updated.id,
+      status: "Cancelled",
+      order: updated,
     });
 
     return res.status(200).json({
       success: true,
-      message: "Order cancelled successfully",
+      message: "Order cancelled successfully.",
       data: updated,
+      refund: refundInfo,
     });
   } catch (error) {
     console.error("Cancel order error:", error);
@@ -1039,12 +1415,19 @@ async function updatePaymentStatusController(req, res) {
       }
     }
 
-    // RULE 4: Refund status must be updated based on Razorpay response, not arbitrary frontend input
+    // RULE 4: Store owners cannot process refunds; Refund status must be updated based on Razorpay response
     if (
       targetStatusLower === "refunded" ||
       targetStatusLower === "partially refunded" ||
       targetStatusLower === "partially_refunded"
     ) {
+      if (req.user && req.user.role === "store_owner") {
+        return res.status(403).json({
+          success: false,
+          message: "Access denied. Store owners are not permitted to process or authorize refunds.",
+        });
+      }
+
       if (isOnline) {
         // Online payments MUST be refunded via Razorpay API
         if (!order.transaction_id && !order.razorpay_payment_id) {
@@ -1210,6 +1593,13 @@ async function refundOrderController(req, res) {
 
     if (!orderId) {
       return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
+
+    if (req.user?.role === "store_owner") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied. Store owners are not permitted to process refunds.",
+      });
     }
 
     const order = await findOrderById(orderId);
@@ -1485,6 +1875,10 @@ async function bulkUpdateOrderStatusHandler(req, res) {
       count: result.updatedCount,
       status,
     });
+    emitToAdmin("admin_order_updated", {
+      count: result.updatedCount,
+      status,
+    });
 
     let message = `Successfully updated ${result.updatedCount} order(s) to '${status}'.`;
     if (result.skippedUnpaidOnline.length > 0) {
@@ -1610,8 +2004,537 @@ async function downloadInvoiceHandler(req, res) {
   }
 }
 
+function generatePosOrderNumber() {
+  const timestamp = Date.now().toString().slice(-5);
+  const random = Math.floor(100 + Math.random() * 900);
+  return `POS-${timestamp}${random}`;
+}
+
+async function createPosSaleController(req, res) {
+  try {
+    await ensureOrderStoreColumns();
+    const cashierUser = req.currentUser || req.user || {};
+    let cashierName =
+      req.body?.cashierName ||
+      cashierUser.name ||
+      cashierUser.email ||
+      req.user?.name ||
+      req.user?.email;
+
+    if (!cashierName || cashierName === "undefined") {
+      if (cashierUser.id) {
+        const dbUser = await db("users")
+          .where({ id: cashierUser.id })
+          .select("name", "email", "role")
+          .first();
+        cashierName =
+          dbUser?.name ||
+          dbUser?.email ||
+          (dbUser?.role === "manager" ? "Manager" : "Admin");
+      } else {
+        cashierName = cashierUser.role === "manager" ? "Manager" : "Admin";
+      }
+    }
+
+    const {
+      customerName = "Walk-in Customer",
+      customerPhone = "",
+      items = [],
+      subtotal = 0,
+      discount = 0,
+      tax = 0,
+      totalAmount = 0,
+      paymentMethod = "Cash",
+      receivedAmount = 0,
+      changeAmount = 0,
+      notes = "",
+    } = req.body || {};
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ success: false, message: "No items in POS cart" });
+    }
+
+    const effectiveStoreId = cashierUser?.role === "store_owner"
+      ? (await getStoreIdForUser(cashierUser))
+      : (req.body.storeId ? Number(req.body.storeId) : null);
+
+    const orderNumber = generatePosOrderNumber();
+
+    const createdOrder = await db.transaction(async (trx) => {
+      // 1. Insert into orders table
+      const [order] = await trx("orders")
+        .insert({
+          order_number: orderNumber,
+          user_id: cashierUser.id,
+          store_id: effectiveStoreId,
+          customer_name: customerName || "Walk-in Customer",
+          customer_phone: customerPhone || "",
+          shipping_address: "In-Store / POS Counter",
+          subtotal: roundCurrency(Number(subtotal) || 0),
+          discount: roundCurrency(Number(discount) || 0),
+          tax_amount: roundCurrency(Number(tax) || 0),
+          total_amount: roundCurrency(Number(totalAmount) || 0),
+          store_gross_amount: roundCurrency(Number(totalAmount) || 0),
+          store_payable_amount: roundCurrency(Number(totalAmount) || 0),
+          admin_commission_amount: 0,
+          is_forwarded_to_store: true,
+          status: "Delivered",
+          payment_status: "Paid",
+          payment_method: paymentMethod || "Cash",
+          notes: notes || `POS Sale (Cashier: ${cashierName}, Received: ₹${receivedAmount || totalAmount}, Change: ₹${changeAmount || 0})`,
+          created_at: trx.fn.now(),
+          updated_at: trx.fn.now(),
+        })
+        .returning("*");
+
+      // 2. Insert order items & decrement stock
+      for (const item of items) {
+        const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+        const price = Number(item.price) || 0;
+        const productId = item.id || item.product_id;
+        const productName = item.name || item.product_name || `Product #${productId || "Item"}`;
+
+        let image = null;
+        if (item.images) {
+          try {
+            const parsed = typeof item.images === "string" ? JSON.parse(item.images) : item.images;
+            if (Array.isArray(parsed) && parsed.length > 0) image = parsed[0];
+          } catch {
+            image = typeof item.images === "string" ? item.images : null;
+          }
+        }
+
+        let costPrice = 0;
+        if (productId) {
+          const prodDb = await trx("products")
+            .where({ id: productId })
+            .select("cost_price", "is_pos_only")
+            .first();
+          if (prodDb?.is_pos_only === true) {
+            costPrice = Number(item.cost_price ?? item.costPrice ?? prodDb.cost_price) || 0;
+          }
+        }
+
+        // Insert into order_items
+        const orderItemRow = {
+          order_id: order.id,
+          product_id: productId || null,
+          product_name: productName,
+          price: price,
+          cost_price: costPrice,
+          quantity: qty,
+          total: roundCurrency(price * qty),
+          image: image,
+          created_at: trx.fn.now(),
+          updated_at: trx.fn.now(),
+        };
+
+        if (effectiveStoreId) {
+          orderItemRow.store_id = effectiveStoreId;
+        }
+
+        await trx("order_items").insert(orderItemRow);
+
+        // Decrement product stock directly in database
+        if (productId) {
+          await trx("products")
+            .where({ id: productId })
+            .update({
+              stock: trx.raw("GREATEST(0, COALESCE(stock, 0) - ?)", [qty]),
+              updated_at: trx.fn.now(),
+            });
+        }
+      }
+
+      // 3. Deduct raw material ingredients based on product recipes (BOM)
+      try {
+        await deductIngredientStockForOrder(order.id, trx);
+      } catch (ingErr) {
+        console.warn("[POS Sale] Recipe ingredient deduction notice:", ingErr.message);
+      }
+
+      return order;
+    });
+
+    try {
+      emitToAdmin("admin_new_order", createdOrder);
+      emitToAdmin("admin_order_updated", createdOrder);
+    } catch (sErr) {}
+
+    return res.status(201).json({
+      success: true,
+      message: "POS sale completed successfully",
+      order: createdOrder,
+    });
+  } catch (error) {
+    console.error("Create POS sale error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to process POS sale" });
+  }
+}
+
+async function getPosSalesHistoryController(req, res) {
+  try {
+    await ensureOrderStoreColumns();
+    const {
+      page = 1,
+      limit = 20,
+      search = "",
+      startDate,
+      endDate,
+      storeId,
+      store_id,
+      timeRange = "total",
+      period,
+    } = req.query;
+    const p = Math.max(1, Number(page) || 1);
+    const l = Math.max(1, Math.min(500, Number(limit) || 50));
+    const offset = (p - 1) * l;
+
+    let baseQuery = db("orders as o")
+      .where(function () {
+        this.where("o.order_number", "like", "POS-%")
+          .orWhere("o.shipping_address", "like", "%POS Counter%")
+          .orWhere("o.shipping_address", "like", "%In-Store%");
+      });
+
+    // Multi-tenant Store Isolation:
+    if (req.user?.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (userStoreId) {
+        baseQuery = baseQuery.where("o.store_id", userStoreId);
+      } else {
+        return res.status(200).json({
+          success: true,
+          data: [],
+          pagination: { total: 0, page: p, limit: l, totalPages: 1 },
+        });
+      }
+    } else {
+      const requestedStore = storeId !== undefined ? storeId : store_id;
+      if (requestedStore !== undefined && requestedStore !== "" && requestedStore !== "ALL") {
+        if (requestedStore === "null" || requestedStore === "admin") {
+          baseQuery = baseQuery.whereNull("o.store_id");
+        } else {
+          baseQuery = baseQuery.where("o.store_id", Number(requestedStore));
+        }
+      }
+    }
+
+    if (search && String(search).trim()) {
+      const s = `%${String(search).trim()}%`;
+      baseQuery = baseQuery.where(function () {
+        this.whereILike("o.order_number", s)
+          .orWhereILike("o.customer_name", s)
+          .orWhereILike("o.customer_phone", s)
+          .orWhereILike("o.notes", s);
+      });
+    }
+
+    // Time Range / Period Filtering (day, week, month, year, total)
+    const filterPeriod = String(timeRange || period || "total").toLowerCase();
+    const now = new Date();
+
+    if (filterPeriod === "day" || filterPeriod === "today") {
+      const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfDay);
+    } else if (filterPeriod === "week" || filterPeriod === "this_week") {
+      const startOfWeek = new Date(now);
+      const day = startOfWeek.getDay();
+      const diff = startOfWeek.getDate() - (day === 0 ? 6 : day - 1); // Monday as start of week
+      startOfWeek.setDate(diff);
+      startOfWeek.setHours(0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfWeek);
+    } else if (filterPeriod === "month" || filterPeriod === "this_month") {
+      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfMonth);
+    } else if (filterPeriod === "year" || filterPeriod === "this_year") {
+      const startOfYear = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+      baseQuery = baseQuery.where("o.created_at", ">=", startOfYear);
+    } else if (filterPeriod === "total" || filterPeriod === "all") {
+      // Total / All time: no date boundary
+    } else if (startDate || endDate) {
+      if (startDate) {
+        baseQuery = baseQuery.where("o.created_at", ">=", startDate);
+      }
+      if (endDate) {
+        baseQuery = baseQuery.where("o.created_at", "<=", endDate);
+      }
+    }
+
+    const [countRow, salesRows, summaryAgg, revenueAgg] = await Promise.all([
+      baseQuery.clone().count("o.id as count").first(),
+      baseQuery.clone().orderBy("o.created_at", "desc").limit(l).offset(offset),
+      baseQuery
+        .clone()
+        .join("order_items as oi", "o.id", "oi.order_id")
+        .join("products as p", "oi.product_id", "p.id")
+        .where("p.is_pos_only", true)
+        .select(
+          db.raw("COALESCE(SUM(oi.total), 0) as total_pos_sales"),
+          db.raw("COALESCE(SUM(COALESCE(oi.cost_price, 0) * oi.quantity), 0) as total_pos_cost"),
+          db.raw("COUNT(DISTINCT o.id) as total_pos_orders"),
+          db.raw("COALESCE(SUM(oi.quantity), 0) as total_pos_items")
+        )
+        .first(),
+      baseQuery
+        .clone()
+        .select(
+          db.raw("COALESCE(SUM(o.total_amount), 0) as total_revenue"),
+          db.raw("COALESCE(SUM(o.discount), 0) as total_discount")
+        )
+        .first(),
+    ]);
+
+    const total = Number(countRow?.count || 0);
+    const orderIds = salesRows.map((o) => o.id);
+
+    let itemsByOrder = {};
+    if (orderIds.length > 0) {
+      const items = await db("order_items as oi")
+        .leftJoin("products as p", "oi.product_id", "p.id")
+        .whereIn("oi.order_id", orderIds)
+        .select("oi.*", "p.is_pos_only")
+        .orderBy("oi.id", "asc");
+      items.forEach((item) => {
+        if (!itemsByOrder[item.order_id]) itemsByOrder[item.order_id] = [];
+        itemsByOrder[item.order_id].push(item);
+      });
+    }
+
+    const sales = salesRows.map((o) => {
+      const orderItems = itemsByOrder[o.id] || [];
+      const posItems = orderItems.filter((it) => it.is_pos_only === true);
+      const hasPosItems = posItems.length > 0;
+
+      const posSalesRevenue = posItems.reduce(
+        (sum, it) => sum + Number(it.total != null ? it.total : Number(it.price || 0) * Number(it.quantity || 1)),
+        0
+      );
+      const posCost = posItems.reduce(
+        (sum, it) => sum + Number(it.cost_price || 0) * (Number(it.quantity) || 1),
+        0
+      );
+      const posProfit = hasPosItems ? Math.max(0, posSalesRevenue - posCost) : null;
+      const posMargin = hasPosItems && posSalesRevenue > 0 ? (posProfit / posSalesRevenue) * 100 : 0;
+
+      return {
+        ...o,
+        has_pos_items: hasPosItems,
+        total_pos_sales: roundCurrency(posSalesRevenue),
+        total_cost: roundCurrency(posCost),
+        total_profit: posProfit != null ? roundCurrency(posProfit) : null,
+        profit_margin: posProfit != null ? Number(posMargin.toFixed(1)) : null,
+        items: orderItems,
+      };
+    });
+
+    const totalPosSales = Number(summaryAgg?.total_pos_sales || 0);
+    const totalPosCost = Number(summaryAgg?.total_pos_cost || 0);
+    const totalProfit = Math.max(0, totalPosSales - totalPosCost);
+    const profitMargin = totalPosSales > 0 ? (totalProfit / totalPosSales) * 100 : 0;
+
+    return res.status(200).json({
+      success: true,
+      data: sales,
+      summary: {
+        totalRevenue: roundCurrency(Number(revenueAgg?.total_revenue || 0)),
+        totalDiscount: roundCurrency(Number(revenueAgg?.total_discount || 0)),
+        totalSales: roundCurrency(totalPosSales),
+        totalCost: roundCurrency(totalPosCost),
+        totalProfit: roundCurrency(totalProfit),
+        profitMargin: Number(profitMargin.toFixed(1)),
+        totalOrders: total,
+        totalPosOrders: Number(summaryAgg?.total_pos_orders || 0),
+        totalItems: Number(summaryAgg?.total_pos_items || 0),
+        period: filterPeriod,
+      },
+      pagination: {
+        total,
+        page: p,
+        limit: l,
+        totalPages: Math.ceil(total / l) || 1,
+      },
+    });
+  } catch (error) {
+    console.error("Get POS sales history error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to fetch POS sales history" });
+  }
+}
+
+async function updatePosSaleController(req, res) {
+  try {
+    await ensureOrderStoreColumns();
+    const orderId = Number(req.params.id);
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: "Invalid order ID" });
+    }
+
+    const {
+      customerName,
+      customerPhone,
+      items = [],
+      subtotal = 0,
+      discount = 0,
+      tax = 0,
+      totalAmount = 0,
+      paymentMethod = "Cash",
+      notes = "",
+    } = req.body || {};
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ success: false, message: "Sale must have at least one product" });
+    }
+
+    const existingOrder = await db("orders").where({ id: orderId }).first();
+    if (!existingOrder) {
+      return res.status(404).json({ success: false, message: "POS order not found" });
+    }
+
+    if (req.user?.role === "store_owner") {
+      const userStoreId = await getStoreIdForUser(req.user);
+      if (Number(existingOrder.store_id) !== Number(userStoreId)) {
+        return res.status(403).json({ success: false, message: "Forbidden: You cannot modify another store's POS sale" });
+      }
+    }
+
+    const updatedOrder = await db.transaction(async (trx) => {
+      // 1. Fetch current items of this order to reverse their product stock
+      const oldItems = await trx("order_items").where({ order_id: orderId });
+      for (const oldItem of oldItems) {
+        const oldPid = oldItem.product_id;
+        const oldQty = Number(oldItem.quantity) || 1;
+        if (oldPid) {
+          // Re-add stock back
+          await trx("products")
+            .where({ id: oldPid })
+            .update({
+              stock: trx.raw("COALESCE(stock, 0) + ?", [oldQty]),
+              updated_at: trx.fn.now(),
+            });
+        }
+      }
+
+      // 2. Restore previous recipe ingredients if they were deducted
+      if (existingOrder.ingredient_stock_deducted && !existingOrder.ingredient_stock_restored) {
+        try {
+          await restoreIngredientStockForOrder(orderId, trx);
+        } catch (resErr) {
+          console.warn("[POS Edit] Ingredient restore notice:", resErr.message);
+        }
+      }
+
+      // Reset ingredient deduction flags so new deduction applies cleanly
+      await trx("orders").where({ id: orderId }).update({
+        ingredient_stock_deducted: false,
+        ingredient_stock_restored: false,
+      });
+
+      // 3. Delete old order_items rows
+      await trx("order_items").where({ order_id: orderId }).del();
+
+      // 4. Update the order with new financial details
+      const [order] = await trx("orders")
+        .where({ id: orderId })
+        .update({
+          customer_name: customerName || existingOrder.customer_name || "Walk-in Customer",
+          customer_phone: customerPhone != null ? customerPhone : existingOrder.customer_phone,
+          subtotal: roundCurrency(Number(subtotal) || 0),
+          discount: roundCurrency(Number(discount) || 0),
+          tax_amount: roundCurrency(Number(tax) || 0),
+          total_amount: roundCurrency(Number(totalAmount) || 0),
+          store_gross_amount: roundCurrency(Number(totalAmount) || 0),
+          store_payable_amount: roundCurrency(Number(totalAmount) || 0),
+          admin_commission_amount: 0,
+          is_forwarded_to_store: true,
+          payment_method: paymentMethod || existingOrder.payment_method || "Cash",
+          notes: notes != null ? notes : existingOrder.notes,
+          updated_at: trx.fn.now(),
+        })
+        .returning("*");
+
+      // 5. Insert new items and deduct new product stock
+      for (const item of items) {
+        const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+        const price = Number(item.price) || 0;
+        const productId = item.id || item.product_id;
+        const productName = item.name || item.product_name || `Product #${productId || "Item"}`;
+
+        let image = null;
+        if (item.images) {
+          try {
+            const parsed = typeof item.images === "string" ? JSON.parse(item.images) : item.images;
+            if (Array.isArray(parsed) && parsed.length > 0) image = parsed[0];
+          } catch {
+            image = typeof item.images === "string" ? item.images : null;
+          }
+        }
+
+        let costPrice = 0;
+        if (productId) {
+          const prodDb = await trx("products")
+            .where({ id: productId })
+            .select("cost_price", "is_pos_only")
+            .first();
+          if (prodDb?.is_pos_only === true) {
+            costPrice = Number(item.cost_price ?? item.costPrice ?? prodDb.cost_price) || 0;
+          }
+        }
+
+        await trx("order_items").insert({
+          order_id: orderId,
+          store_id: existingOrder.store_id || null,
+          product_id: productId || null,
+          product_name: productName,
+          price: price,
+          cost_price: costPrice,
+          quantity: qty,
+          total: roundCurrency(price * qty),
+          image: image,
+          created_at: trx.fn.now(),
+          updated_at: trx.fn.now(),
+        });
+
+        if (productId) {
+          await trx("products")
+            .where({ id: productId })
+            .update({
+              stock: trx.raw("GREATEST(0, COALESCE(stock, 0) - ?)", [qty]),
+              updated_at: trx.fn.now(),
+            });
+        }
+      }
+
+      // 6. Deduct new raw materials ingredients based on updated items
+      try {
+        await deductIngredientStockForOrder(orderId, trx);
+      } catch (ingErr) {
+        console.warn("[POS Edit] New ingredient deduction notice:", ingErr.message);
+      }
+
+      return order;
+    });
+
+    try {
+      emitToAdmin("admin_order_updated", updatedOrder);
+      emitToAdmin("admin_order_status_updated", updatedOrder);
+    } catch (sErr) {}
+
+    return res.status(200).json({
+      success: true,
+      message: "POS sale updated successfully. Revenue and stock refreshed.",
+      order: updatedOrder,
+    });
+  } catch (error) {
+    console.error("Update POS sale error:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to update POS sale" });
+  }
+}
+
 module.exports = {
   createOrder,
+  createPosSaleController,
+  getPosSalesHistoryController,
+  updatePosSaleController,
   getUserOrders,
   getOrderDetails,
   getAdminOrders,
@@ -1622,6 +2545,7 @@ module.exports = {
   refundOrderController,
   acceptOrderController,
   rejectOrderController,
+  forwardOrderToStoreHandler,
   verifyRazorpayPayment,
   retryPaymentController,
   bulkUpdateOrderStatusHandler,

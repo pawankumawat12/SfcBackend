@@ -55,12 +55,12 @@ function uploadFile(file, options = {}) {
     }
 
     const stream = cloudinary.uploader.upload_stream(
-      // uploadOptions,
-       (error, result) => {
-      if (error) {
-      console.error("error object:", JSON.stringify(error, null, 2));
-        return reject(error);
-      }
+      uploadOptions,
+      (error, result) => {
+        if (error) {
+          console.error("Cloudinary upload error:", error);
+          return reject(error);
+        }
 
       resolve({
         url: result.secure_url || result.url,

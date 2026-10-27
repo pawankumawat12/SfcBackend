@@ -99,8 +99,14 @@ async function getMostFavouritedProducts({
 
   // Overview stats query
   const statsQuery = Promise.all([
-    db("wishlist_items").count("id as total_favourites").first(),
-    db("wishlist_items").countDistinct("product_id as unique_products").first(),
+    db("wishlist_items as w")
+      .join("products as p", "p.id", "w.product_id")
+      .count("w.id as total_favourites")
+      .first(),
+    db("wishlist_items as w")
+      .join("products as p", "p.id", "w.product_id")
+      .countDistinct("w.product_id as unique_products")
+      .first(),
     db("wishlist_items as w")
       .join("products as p", "p.id", "w.product_id")
       .select("p.name", db.raw("COUNT(w.id) as count"))
@@ -159,4 +165,3 @@ async function getMostFavouritedProducts({
 module.exports = {
   getMostFavouritedProducts,
 };
-

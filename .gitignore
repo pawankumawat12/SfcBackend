@@ -9,3 +9,5 @@ logs/
 *.log
 
 .DS_Store
+whatsapp_auth/
+.whatsapp_auth/

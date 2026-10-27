@@ -25,13 +25,14 @@ async function respondWithWishlist(res, userId, message, extra = {}, paginationP
 
 async function getWishlist(req, res) {
   try {
-    const { page, limit } = req.query || {};
+    const { page, limit, store_id, storeId } = req.query || {};
+    const selectedStoreId = store_id || storeId;
     return respondWithWishlist(
       res,
       req.user.id,
       "Wishlist fetched successfully",
       {},
-      { page, limit }
+      { page, limit, storeId: selectedStoreId }
     );
   } catch (error) {
     console.error("Get wishlist error:", error);

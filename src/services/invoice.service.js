@@ -34,7 +34,7 @@ async function generateInvoicePdf(order, res) {
 
   const formatCurrency = (amount) => {
     const num = roundCurrency(amount);
-    return `Rs. ${num.toFixed(2)}`;
+    return `Rs. ${Math.round(num)}`;
   };
 
   const formatDate = (dateStr) => {

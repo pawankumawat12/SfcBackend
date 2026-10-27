@@ -9,6 +9,14 @@ const {
 const createAddressController = async (req, res) => {
   try {
     const userId = req.user.id;
+    const { phone_number } = req.body;
+
+    if (!phone_number || !String(phone_number).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Mobile phone number is required for delivery addresses",
+      });
+    }
 
     const address = await createAddress({
       ...req.body,

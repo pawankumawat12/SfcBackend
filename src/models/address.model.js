@@ -1,11 +1,20 @@
 const knex = require("../../config/db");
+const { geocodeAddress } = require("../utils/geocoding.util");
 
 const TABLE = "addresses";
 
 const createAddress = async (addressData) => {
-  // Ensure latitude and longitude are present to satisfy DB constraints
-  if (addressData.latitude == null) addressData.latitude = 0;
-  if (addressData.longitude == null) addressData.longitude = 0;
+  // If coordinates are missing or zero, auto-resolve via free geocoding
+  const numLat = Number(addressData.latitude);
+  const numLng = Number(addressData.longitude);
+  if (!numLat || isNaN(numLat) || numLat === 0 || !numLng || isNaN(numLng) || numLng === 0) {
+    const resolved = await geocodeAddress(addressData);
+    addressData.latitude = resolved.latitude;
+    addressData.longitude = resolved.longitude;
+  } else {
+    addressData.latitude = numLat;
+    addressData.longitude = numLng;
+  }
 
   // Check if this is user's first address
   const existingCount = await knex(TABLE)
@@ -55,6 +64,23 @@ const updateAddress = async (id, userId, updateData) => {
   delete data.id;
   delete data.user_id;
   delete data.created_at;
+
+  const numLat = Number(data.latitude);
+  const numLng = Number(data.longitude);
+  if (!numLat || isNaN(numLat) || numLat === 0 || !numLng || isNaN(numLng) || numLng === 0) {
+    if (data.formatted_address || data.city || data.pincode) {
+      const existing = await getAddressById(id, userId);
+      const merged = { ...existing, ...data };
+      const resolved = await geocodeAddress(merged);
+      if (resolved.latitude !== 0 && resolved.longitude !== 0) {
+        data.latitude = resolved.latitude;
+        data.longitude = resolved.longitude;
+      }
+    }
+  } else {
+    data.latitude = numLat;
+    data.longitude = numLng;
+  }
 
   if (data.is_default) {
     await knex(TABLE)

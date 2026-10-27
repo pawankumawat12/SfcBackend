@@ -8,6 +8,7 @@ const {
   findCategoriesByIds,
   countCategories,
   countChildCategories,
+  getCategoryStats,
   createCategory,
   updateCategory,
   deleteCategory,
@@ -47,15 +48,43 @@ async function listCategories(req, res) {
       });
     }
 
-    const [categories, total] = await Promise.all([
+    const isStorefront =
+      req.headers["x-client-type"] === "storefront" ||
+      req.query.include_admin === "true" ||
+      req.query.include_admin === true ||
+      req.query.scope === "storefront";
+
+    if (isStorefront) {
+      filters.includeAdmin = true;
+    }
+
+    const adminOnly =
+      req.query.admin_only === "true" ||
+      req.query.admin_only === true ||
+      req.query.store_id === "admin";
+
+    if (adminOnly) {
+      filters.adminOnly = true;
+    } else if (req.user && req.user.role === "store_owner") {
+      filters.storeId = req.user.store_id;
+    } else if (req.query.store_id && req.query.store_id !== "admin") {
+      filters.storeId = Number(req.query.store_id);
+    }
+
+    const [categories, total, categoryStats] = await Promise.all([
       findCategories({ page, limit, offset, ...filters }),
       countCategories(filters),
+      getCategoryStats().catch((err) => {
+        console.error("Error fetching category stats:", err);
+        return { total: 0, active: 0, inactive: 0 };
+      }),
     ]);
 
     return res.status(200).json({
       message: "Categories fetched successfully",
       data: categories,
       pagination: buildPaginationMeta(page, limit, total),
+      summary: categoryStats,
     });
   } catch (error) {
     console.error("List categories error:", error);

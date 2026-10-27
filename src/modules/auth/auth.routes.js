@@ -17,6 +17,7 @@ const {
   verifyPasswordResetToken,
   resetPassword,
   updateProfile,
+  changePassword,
   requestEmailChange,
   resendEmailChangeOtp,
   verifyEmailChange,
@@ -77,6 +78,7 @@ router.put(
   uploadImage.single("image"),
   updateProfile
 );
+router.put("/change-password", verifyToken, changePassword);
 
 // Email Change with OTP
 router.post("/request-email-change", verifyToken, requestEmailChange);

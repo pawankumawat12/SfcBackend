@@ -14,6 +14,8 @@ const {
   validateLogin,
   validatePassword,
   validateUpdateProfile,
+  normalizeIndianPhone,
+  isValidIndianPhone,
 } = require("./auth.validation");
 const {
   findUserByEmail,
@@ -57,6 +59,16 @@ const PASSWORD_RESET_EXPIRY_MS = 15 * 60 * 1000;
 const isEmailVerifyEnabled = () => {
   const val = process.env.IS_EMAIL_VERIFY;
   if (val === undefined || val === null || val === "") return true;
+  return String(val).trim().toLowerCase() === "true";
+};
+
+// Determines whether Email Change OTP verification is required (only when EMAILVERIFY/EMAIL_VERIFY/IS_EMAIL_VERIFY is 'true')
+const isEmailChangeVerifyRequired = () => {
+  const val =
+    process.env.EMAILVERIFY ??
+    process.env.EMAIL_VERIFY ??
+    process.env.IS_EMAIL_VERIFY;
+  if (val === undefined || val === null || val === "") return false;
   return String(val).trim().toLowerCase() === "true";
 };
 
@@ -207,19 +219,19 @@ const forgotPassword = async (req, res) => {
       return res.status(404).json({ message: "Email does not exist" });
     }
 
-    // Role-based authorization: prevent admin accounts from resetting via customer frontend, and vice-versa
+    // Role-based authorization: allow admin and store_owner on admin portal, prevent customer storefront from resetting them
     const origin = String(req.headers.origin || req.headers.referer || "");
     const isAdminSource = requestedRole === "admin" || origin.includes("5173");
 
     if (isAdminSource) {
-      if (user.role !== "admin") {
+      if (user.role !== "admin" && user.role !== "store_owner" && user.role !== "manager") {
         return res.status(403).json({
           message: "Email does not exist",
         });
       }
     } else {
       // Customer frontend source
-      if (user.role === "admin") {
+      if (user.role === "admin" || user.role === "store_owner" || user.role === "manager") {
         return res.status(403).json({
           message: "Email does not exist",
         });
@@ -506,6 +518,18 @@ const sendOtp = async (req, res) => {
       });
     }
 
+    const isStorefrontClient =
+      req.headers["x-client-type"] === "storefront" ||
+      req.body?.role === "user" ||
+      req.query?.role === "user";
+
+    if (isStorefrontClient && user.role === "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin accounts cannot be used on the customer storefront. Please use the Admin Panel.",
+      });
+    }
+
     // Allow resending OTP if user is admin (2FA login), if an OTP was already issued, or if type/role specifies login
     const requestedRole = req.body?.role || req.query?.role;
     const requestType = req.body?.type || req.query?.type;
@@ -581,6 +605,17 @@ const verifyOtp = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "No registration found with this email address. Please create an account first.",
+      });
+    }
+
+    const isStorefrontClient =
+      req.headers["x-client-type"] === "storefront" ||
+      req.body?.role === "user";
+
+    if (isStorefrontClient && user.role === "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid Credentials",
       });
     }
 
@@ -672,6 +707,11 @@ const verifyOtp = async (req, res) => {
         token: accessToken,
         phone: user.phone,
         role: user.role,
+        permissions: Array.isArray(user.permissions)
+          ? user.permissions
+          : typeof user.permissions === "string"
+            ? (() => { try { return JSON.parse(user.permissions); } catch { return []; } })()
+            : [],
         image: user.image,
         is_active: user.is_active !== false,
         is_blocked: Boolean(user.is_blocked),
@@ -709,7 +749,7 @@ async function register(req, res) {
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const normalizedEmail = email ? email.trim().toLowerCase() : null;
-    const normalizedPhone = phone ? phone.trim() : null;
+    const normalizedPhone = phone ? normalizeIndianPhone(phone) : null;
 
     // 1. Check if user with this email already exists
     if (normalizedEmail) {
@@ -998,7 +1038,7 @@ async function login(req, res) {
       const normalizedEmail = email.trim().toLowerCase();
       user = await findUserByEmail(normalizedEmail);
     } else if (phone) {
-      user = await findUserByPhone(phone.trim());
+      user = await findUserByPhone(normalizeIndianPhone(phone));
     }
 
     if (!user || user.role !== "user") {
@@ -1108,17 +1148,30 @@ async function adminLogin(req, res) {
         .status(400)
         .json({ message: "Email and password are required" });
     const admin = await findUserByEmail(email);
-    if (
-      !admin ||
-      admin.role !== "admin" ||
-      !(await bcrypt.compare(password, admin.password))
-    )
-      return res.status(404).json({ message: "Invalid admin credentials" });
+    if (!admin) {
+      return res.status(404).json({ message: "Invalid credentials" });
+    }
+
+    if (admin.role !== "admin" && admin.role !== "store_owner" && admin.role !== "manager") {
+      return res.status(404).json({ message: "Invalid credentials" });
+    }
+
+    if ((admin.role === "store_owner" || admin.role === "manager") && !admin.password) {
+      return res.status(403).json({
+        success: false,
+        isPasswordNotSet: true,
+        message: "Your password has not been set yet. A password setup link was sent to your registered email. Please check your inbox to set your password.",
+      });
+    }
+
+    if (!(await bcrypt.compare(password, admin.password))) {
+      return res.status(404).json({ message: "Invalid credentials" });
+    }
 
     if (admin.is_blocked || admin.is_active === false) {
       return res.status(403).json({
         success: false,
-        message: admin.block_reason || "Admin account is inactive or blocked.",
+        message: admin.block_reason || "This account is inactive or blocked.",
       });
     }
 
@@ -1147,6 +1200,11 @@ async function adminLogin(req, res) {
           name: admin.name,
           email: admin.email,
           role: admin.role,
+          permissions: Array.isArray(admin.permissions)
+            ? admin.permissions
+            : typeof admin.permissions === "string"
+              ? (() => { try { return JSON.parse(admin.permissions); } catch { return []; } })()
+              : [],
           image: admin.image,
           is_active: admin.is_active !== false,
         },
@@ -1237,6 +1295,13 @@ async function googleAuth(req, res) {
 
     // 2. Existing user handling
     if (user) {
+      if (user.role === "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "Invalid Credentials.",
+        });
+      }
+
       if (user.is_blocked || user.is_active === false) {
         return res.status(403).json({
           success: false,
@@ -1364,6 +1429,17 @@ const refreshAccessToken = async (req, res) => {
     }
 
     if (user.is_blocked || user.is_active === false) {
+      if (user.role === "store_owner" && user.is_active === false) {
+        const clearOptions = getCookieClearOptions(req);
+        res.clearCookie("accessToken", clearOptions);
+        res.clearCookie("refreshToken", clearOptions);
+        return res.status(401).json({
+          success: false,
+          sessionRevoked: true,
+          message: "Your store has been deleted. You have been signed out.",
+        });
+      }
+
       return res.status(403).json({
         success: false,
         message: user.block_reason || "Your account has been deactivated or blocked.",
@@ -1394,6 +1470,11 @@ const refreshAccessToken = async (req, res) => {
         email: user.email,
         phone: user.phone,
         role: user.role,
+        permissions: Array.isArray(user.permissions)
+          ? user.permissions
+          : typeof user.permissions === "string"
+            ? (() => { try { return JSON.parse(user.permissions); } catch { return []; } })()
+            : [],
         image: user.image,
         token: newAccessToken,
         is_active: user.is_active !== false,
@@ -1413,8 +1494,20 @@ const refreshAccessToken = async (req, res) => {
 
 const getMe = async (req, res) => {
   try {
-    const user = await findUserById(req.user.id);
+    const user = req.currentUser || (await findUserById(req.user.id));
     if (!user) return res.status(404).json({ message: "User not found" });
+
+    const isStorefrontClient =
+      req.headers["x-client-type"] === "storefront" ||
+      req.headers["x-client-role"] === "user";
+
+    if (isStorefrontClient && (user.role === "admin" || user.role === "manager")) {
+      return res.status(403).json({
+        success: false,
+        message: "Admin accounts cannot be used on the customer storefront. Please use customer credentials.",
+        isAdminOnStorefront: true,
+      });
+    }
 
     const token =
       (req.headers.authorization && req.headers.authorization.startsWith("Bearer ")
@@ -1431,6 +1524,12 @@ const getMe = async (req, res) => {
         email: user.email,
         phone: user.phone,
         role: user.role,
+        store_id: user.store_id || req.user?.store_id || null,
+        permissions: Array.isArray(user.permissions)
+          ? user.permissions
+          : typeof user.permissions === "string"
+            ? (() => { try { return JSON.parse(user.permissions); } catch { return []; } })()
+            : [],
         image: user.image,
         token,
         is_active: user.is_active !== false,
@@ -1506,6 +1605,46 @@ const requestEmailChange = async (req, res) => {
       });
     }
 
+    // Check if verification via OTP is required by environment config
+    if (!isEmailChangeVerifyRequired()) {
+      const updatedUsers = await db("users")
+        .where({ id: userId })
+        .update({
+          email: normalizedEmail,
+          is_email_verified: true,
+          pending_email: null,
+          pending_email_otp: null,
+          pending_email_expire_at: null,
+          pending_email_sent_at: null,
+          pending_email_resend_count: 0,
+          pending_email_resend_locked_until: null,
+          updated_at: new Date(),
+        })
+        .returning([
+          "id",
+          "name",
+          "email",
+          "phone",
+          "role",
+          "image",
+        ]);
+
+      const updatedUser = Array.isArray(updatedUsers) ? updatedUsers[0] : updatedUsers;
+      const accessToken = generateAccessToken(updatedUser);
+      const refreshToken = generateRefreshToken(updatedUser);
+
+      res.cookie("accessToken", accessToken, getAccessTokenCookieOptions(req));
+      res.cookie("refreshToken", refreshToken, getRefreshTokenCookieOptions(req));
+
+      return res.status(200).json({
+        success: true,
+        requiresOtp: false,
+        message: "Email address updated successfully!",
+        user: updatedUser,
+        accessToken,
+      });
+    }
+
     const now = new Date();
 
     // Check resend lock
@@ -1563,15 +1702,19 @@ const requestEmailChange = async (req, res) => {
         pending_email_resend_locked_until: lockedUntil,
       });
 
+    // Send OTP to CURRENT EMAIL (before email) per requirement
     await sendEmailChangeOtp({
-      email: normalizedEmail,
+      email: user.email,
+      newEmail: normalizedEmail,
       otp,
       userName: user.name || "there",
     });
 
     return res.status(200).json({
       success: true,
-      message: `Verification code sent to ${normalizedEmail}`,
+      requiresOtp: true,
+      message: `Verification code sent to your current email (${user.email})`,
+      currentEmail: user.email,
       pendingEmail: normalizedEmail,
       retryAfter: OTP_RESEND_COOLDOWN_MS / 1000,
     });
@@ -1645,15 +1788,18 @@ const resendEmailChangeOtp = async (req, res) => {
         pending_email_resend_locked_until: lockedUntil,
       });
 
+    // Send OTP to CURRENT EMAIL (before email) per requirement
     await sendEmailChangeOtp({
-      email: pendingEmail,
+      email: user.email,
+      newEmail: pendingEmail,
       otp,
       userName: user.name || "there",
     });
 
     return res.status(200).json({
       success: true,
-      message: `New verification code resent to ${pendingEmail}`,
+      message: `New verification code resent to your current email (${user.email})`,
+      currentEmail: user.email,
       pendingEmail,
       retryAfter: OTP_RESEND_COOLDOWN_MS / 1000,
     });
@@ -1827,7 +1973,7 @@ const updateProfile = async (req, res) => {
 
     const trimmedName = name.trim();
     const trimmedEmail = email ? email.trim().toLowerCase() : null;
-    const trimmedPhone = phone ? phone.trim() : null;
+    const trimmedPhone = phone ? normalizeIndianPhone(phone) : null;
 
     // Check if phone is already taken by another user
     if (trimmedPhone && trimmedPhone !== currentUser.phone) {
@@ -1857,11 +2003,13 @@ const updateProfile = async (req, res) => {
       }
     }
 
+    const shouldVerifyEmailChange = isEmailChanging && isEmailChangeVerifyRequired();
+
     const updateData = {
       name: trimmedName,
       phone: trimmedPhone,
-      // Note: we KEEP current email until verified via OTP if email was changed!
-      email: isEmailChanging ? currentUser.email : trimmedEmail,
+      email: shouldVerifyEmailChange ? currentUser.email : trimmedEmail,
+      ...(shouldVerifyEmailChange ? {} : { is_email_verified: true }),
       updated_at: new Date(),
     };
 
@@ -1893,8 +2041,8 @@ const updateProfile = async (req, res) => {
       ? updatedUsers[0]
       : updatedUsers;
 
-    // If customer entered a new email, trigger the OTP verification process automatically
-    if (isEmailChanging) {
+    // If customer/admin entered a new email and OTP verification is required:
+    if (shouldVerifyEmailChange) {
       const now = new Date();
       const otp = crypto.randomInt(100000, 1000000).toString();
       const expireAt = new Date(now.getTime() + 10 * 60 * 1000);
@@ -1910,16 +2058,20 @@ const updateProfile = async (req, res) => {
           pending_email_resend_locked_until: null,
         });
 
+      // Send OTP to CURRENT EMAIL (before email) per requirement
       await sendEmailChangeOtp({
-        email: trimmedEmail,
+        email: currentUser.email,
+        newEmail: trimmedEmail,
         otp,
-        userName: currentUser.name || "there",
+        userName: currentUser.name || "Administrator",
       });
 
       return res.status(200).json({
         success: true,
-        message: `Profile updated. A 4-digit verification code was sent to ${trimmedEmail} to complete your email change.`,
+        message: `Profile details saved. A 6-digit verification code was sent to your current email (${currentUser.email}) to confirm changing your email to ${trimmedEmail}.`,
         requiresEmailOtp: true,
+        requiresOtp: true,
+        currentEmail: currentUser.email,
         pendingEmail: trimmedEmail,
         user: {
           id: updatedUser.id,
@@ -1959,6 +2111,7 @@ const getCustomers = async (req, res) => {
       message: "Customers fetched successfully",
       data: result.customers,
       pagination: result.pagination,
+      summary: result.summary,
     });
   } catch (error) {
     console.error("Get customers error:", error);
@@ -1981,10 +2134,34 @@ async function editCustomer(req, res) {
         .json({ success: false, message: "Customer not found" });
     }
 
+    let customerPhone = existing.phone;
+    if (phone !== undefined && phone !== null && String(phone).trim() !== "") {
+      const normalizedPhone = normalizeIndianPhone(phone);
+      if (!isValidIndianPhone(normalizedPhone)) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter a valid 10-digit Indian phone number.",
+        });
+      }
+      const duplicatePhone = await db("users")
+        .where({ phone: normalizedPhone })
+        .whereNot({ id: customerId })
+        .first();
+      if (duplicatePhone) {
+        return res.status(400).json({
+          success: false,
+          message: "Phone number is already registered to another customer.",
+        });
+      }
+      customerPhone = normalizedPhone;
+    } else if (phone === "") {
+      customerPhone = null;
+    }
+
     const updated = await updateUser(customerId, {
       name: name ? name.trim() : existing.name,
       email: email ? email.trim().toLowerCase() : existing.email,
-      phone: phone ? phone.trim() : existing.phone,
+      phone: customerPhone,
       updated_at: new Date(),
     });
 
@@ -2102,7 +2279,7 @@ async function submitBlockedSupportRequest(req, res) {
       user_id: user ? user.id : null,
       name: (name || user?.name || "Customer").trim(),
       email: normalizedEmail,
-      phone: phone || user?.phone || null,
+      phone: phone ? normalizeIndianPhone(phone) : (user?.phone || null),
       message: message.trim(),
       status: "pending",
     });
@@ -2291,6 +2468,87 @@ async function bulkDeleteCustomersHandler(req, res) {
   }
 }
 
+const changePassword = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const { currentPassword, newPassword, confirmPassword } = req.body || {};
+
+    if (!currentPassword || !String(currentPassword).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Current password is required",
+      });
+    }
+
+    if (!newPassword || !String(newPassword).trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "New password is required",
+      });
+    }
+
+    if (String(newPassword).length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: "New password must be at least 8 characters long",
+      });
+    }
+
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "New password and confirmation password do not match",
+      });
+    }
+
+    const user = await findUserById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    // Verify current password if user has a password set
+    if (user.password) {
+      const isCurrentMatch = await bcrypt.compare(currentPassword, user.password);
+      if (!isCurrentMatch) {
+        return res.status(400).json({
+          success: false,
+          message: "Current password does not match our records",
+        });
+      }
+
+      // Disallow re-using the current password
+      const isSamePassword = await bcrypt.compare(newPassword, user.password);
+      if (isSamePassword) {
+        return res.status(400).json({
+          success: false,
+          message: "New password must be different from your current password",
+        });
+      }
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await updateUser(userId, {
+      password: hashedPassword,
+      updated_at: new Date(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Password changed successfully!",
+    });
+  } catch (error) {
+    console.error("Change password error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to change password. Please try again.",
+    });
+  }
+};
+
 module.exports = {
   forgotPassword,
   resendPasswordResetOtp,
@@ -2308,6 +2566,7 @@ module.exports = {
   getMe,
   logout,
   updateProfile,
+  changePassword,
   requestEmailChange,
   resendEmailChangeOtp,
   verifyEmailChange,
@@ -2322,4 +2581,3 @@ module.exports = {
   getBlockedSupportRequests,
   resolveBlockedSupportRequest,
 };
-

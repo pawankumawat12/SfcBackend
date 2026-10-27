@@ -8,8 +8,6 @@ const {
   updateLogoSettings,
   getOrderPricingSettings,
   updateOrderPricingSettings,
-  getSmtpSettings,
-  updateSmtpSettings,
   getResendSettings,
   updateResendSettings,
   getStoreStatusSettings,
@@ -17,6 +15,7 @@ const {
   getPaymentSettings,
   updatePaymentSettings,
 } = require("../../models/settings.model");
+const { generateQrSvg, generateQrDataUrl } = require("../../services/qrCode.service");
 const { testResendConnection, sendMail } = require("../../services/resend.service");
 const {
   uploadFile,
@@ -73,6 +72,12 @@ async function updateTheme(req, res) {
       colorTheme,
       availableColorThemes,
     });
+
+    try {
+      emitToAll("theme_updated", updated);
+    } catch (err) {
+      console.warn("Could not emit theme_updated event:", err?.message);
+    }
 
     return res.status(200).json({
       success: true,
@@ -596,6 +601,227 @@ async function updateStoreStatus(req, res) {
     return res.status(500).json({
       success: false,
       message: "Failed to update store status",
+    });
+  }
+}
+
+function getScanBaseUrl(req, qrSettings) {
+  // 1. Explicitly configured base_url in dynamic_qr settings
+  if (qrSettings?.base_url && String(qrSettings.base_url).trim()) {
+    return String(qrSettings.base_url).trim().replace(/\/+$/, "");
+  }
+
+  // 2. Auto-derive origin if destination_url is an absolute HTTP/HTTPS URL
+  if (qrSettings?.destination_url) {
+    try {
+      const parsed = new URL(String(qrSettings.destination_url).trim());
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        return parsed.origin;
+      }
+    } catch (e) {
+      // not a full URL
+    }
+  }
+
+  // 3. Fallback to FRONTEND_URL env if set
+  const frontendUrl = (process.env.FRONTEND_URL || "").trim().replace(/\/+$/, "");
+  if (frontendUrl) return frontendUrl;
+
+  // 4. Request protocol + host
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
+
+function getPermanentScanUrl(req, data) {
+  const baseUrl = getScanBaseUrl(req, data);
+  return `${baseUrl}/qr`;
+}
+
+function resolveQrTargetUrl(req, data) {
+  const dest = (data?.destination_url || "").trim();
+  if (dest && /^https?:\/\//i.test(dest)) {
+    return dest;
+  }
+  const baseUrl = getScanBaseUrl(req, data);
+  if (dest) {
+    return `${baseUrl}${dest.startsWith("/") ? dest : `/${dest}`}`;
+  }
+  return baseUrl || "https://sfc-front.vercel.app";
+}
+
+async function handleQrRedirect(req, res) {
+  try {
+    const data = await getDynamicQrSettings();
+    const targetUrl = resolveQrTargetUrl(req, data);
+    return res.redirect(302, targetUrl);
+  } catch (error) {
+    console.error("QR redirect error:", error);
+    const fallback = process.env.FRONTEND_URL || "https://sfc-front.vercel.app";
+    return res.redirect(302, fallback);
+  }
+}
+
+async function getPublicQrDestination(req, res) {
+  try {
+    const data = await getDynamicQrSettings();
+    const targetUrl = resolveQrTargetUrl(req, data);
+    return res.status(200).json({
+      success: true,
+      destination_url: data?.destination_url || "/",
+      target_url: targetUrl,
+    });
+  } catch (error) {
+    console.error("Get public QR destination error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to get QR destination",
+    });
+  }
+}
+
+async function getDynamicQr(req, res) {
+  try {
+    const data = await getDynamicQrSettings();
+    const permanentScanUrl = getPermanentScanUrl(req, data);
+    const targetUrl = resolveQrTargetUrl(req, data);
+    const qrSvg = generateQrSvg(permanentScanUrl);
+    const qrDataUrl = generateQrDataUrl(permanentScanUrl);
+
+    return res.status(200).json({
+      success: true,
+      message: "QR settings fetched successfully",
+      data: {
+        ...data,
+        scan_url: permanentScanUrl,
+        target_url: targetUrl,
+        qr_svg: qrSvg,
+        qr_data_url: qrDataUrl,
+      },
+    });
+  } catch (error) {
+    console.error("Get dynamic QR error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch dynamic QR settings",
+    });
+  }
+}
+
+async function updateDynamicQr(req, res) {
+  try {
+    const { title, description, destination_url, base_url } = req.body;
+
+    if (destination_url !== undefined) {
+      const trimmedUrl = String(destination_url).trim();
+      if (!trimmedUrl) {
+        return res.status(400).json({
+          success: false,
+          message: "Destination URL cannot be empty",
+        });
+      }
+
+      // Allow relative paths starting with / or full HTTP/HTTPS URLs
+      const isRelative = trimmedUrl.startsWith("/");
+      const isAbsolute = /^https?:\/\//i.test(trimmedUrl);
+      if (!isRelative && !isAbsolute) {
+        return res.status(400).json({
+          success: false,
+          message: "Destination URL must start with http://, https://, or / (e.g. /menu or https://sfcbakers.com)",
+        });
+      }
+
+      // Block dangerous protocols
+      if (/^(javascript|data|vbscript|file):/i.test(trimmedUrl)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid destination URL protocol",
+        });
+      }
+    }
+
+    const data = await updateDynamicQrSettings({
+      title,
+      description,
+      destination_url,
+      base_url,
+    });
+
+    const permanentScanUrl = getPermanentScanUrl(req, data);
+    const targetUrl = resolveQrTargetUrl(req, data);
+    const qrSvg = generateQrSvg(permanentScanUrl);
+    const qrDataUrl = generateQrDataUrl(permanentScanUrl);
+
+    return res.status(200).json({
+      success: true,
+      message: "QR settings updated successfully",
+      data: {
+        ...data,
+        scan_url: permanentScanUrl,
+        target_url: targetUrl,
+        qr_svg: qrSvg,
+        qr_data_url: qrDataUrl,
+      },
+    });
+  } catch (error) {
+    console.error("Update dynamic QR error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update dynamic QR settings",
+    });
+  }
+}
+
+async function downloadDynamicQr(req, res) {
+  try {
+    const data = await getDynamicQrSettings();
+    const permanentScanUrl = getPermanentScanUrl(req, data);
+
+    const svg = generateQrSvg(permanentScanUrl, { size: 512, margin: 4 });
+    const filename = `sfc-qr.svg`;
+
+    res.setHeader("Content-Type", "image/svg+xml");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    return res.send(svg);
+  } catch (error) {
+    console.error("Download dynamic QR error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to download QR code",
+    });
+  }
+}
+
+async function getDeveloper(req, res) {
+  try {
+    const data = await getDeveloperSettings();
+    return res.status(200).json({
+      success: true,
+      message: "Developer settings fetched successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Get developer settings error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch developer settings",
+    });
+  }
+}
+
+async function updateDeveloper(req, res) {
+  try {
+    const data = await updateDeveloperSettings(req.body);
+    return res.status(200).json({
+      success: true,
+      message: "Developer settings updated successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Update developer settings error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update developer settings",
     });
   }
 }

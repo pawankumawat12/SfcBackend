@@ -1,3 +1,4 @@
+const db = require("../../config/db");
 const { getOrderPricingSettings } = require("../models/settings.model");
 
 /**
@@ -33,13 +34,13 @@ function calculateDistanceInKm(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Safely rounds a currency value to 2 decimal places using Math.round and Number.EPSILON
- * to avoid floating-point precision issues.
+ * Safely rounds a currency value to whole integers using Math.round
+ * Ensures no price has decimal points (e.g., 15.4 -> 15, 15.6 -> 16).
  */
 function roundCurrency(val) {
   const num = Number(val);
   if (isNaN(num) || !isFinite(num)) return 0;
-  return Math.round((num + Number.EPSILON) * 100) / 100;
+  return Math.round(num);
 }
 
 /**
@@ -259,9 +260,37 @@ async function calculateCartAndOrderPricing({
     ? roundCurrency(minimumOrderAmount - rawSubtotal)
     : 0;
 
-  // 4. Distance Calculation
+  // 4. Distance Calculation & Range Check per Fulfilling Store
   let distanceKm = null;
+  let isOutOfRange = false;
+  let maxDeliveryDistance = null;
+  let resolvedStoreResult = null;
+
   if (
+    deliveryAddress &&
+    deliveryAddress.latitude != null &&
+    deliveryAddress.longitude != null
+  ) {
+    try {
+      const { resolveStoreByCustomerLocation } = require("../models/store.model");
+      resolvedStoreResult = await resolveStoreByCustomerLocation(
+        deliveryAddress.latitude,
+        deliveryAddress.longitude
+      );
+    } catch (e) {
+      console.warn("Could not resolve store by location in pricing:", e.message);
+    }
+  }
+
+  const activeStoreType = resolvedStoreResult ? resolvedStoreResult.storeType : "admin";
+  const activeStore = resolvedStoreResult ? resolvedStoreResult.store : null;
+  const activeStoreId = (activeStoreType === "branch" && activeStore?.id) ? Number(activeStore.id) : null;
+  const activeCanDeliver = resolvedStoreResult ? resolvedStoreResult.can_deliver !== false && !resolvedStoreResult.outOfDeliveryZone : true;
+
+  if (activeStore && resolvedStoreResult?.distanceKm != null) {
+    distanceKm = Number(resolvedStoreResult.distanceKm);
+    maxDeliveryDistance = Number(activeStore.max_delivery_distance) || 10;
+  } else if (
     deliveryAddress &&
     deliveryAddress.latitude != null &&
     deliveryAddress.longitude != null &&
@@ -274,13 +303,54 @@ async function calculateCartAndOrderPricing({
       deliveryAddress.latitude,
       deliveryAddress.longitude
     );
+    maxDeliveryDistance = Number(settings.max_delivery_distance) || 15;
   }
 
-  const maxDeliveryDistance = Number(settings.max_delivery_distance) || 0;
-  const isOutOfRange =
-    maxDeliveryDistance > 0 && distanceKm != null
-      ? distanceKm > maxDeliveryDistance
-      : false;
+  // Check each item for store mismatch or delivery range issues
+  let hasUndeliverableItems = false;
+  let undeliverableItemsCount = 0;
+
+  if (Array.isArray(items)) {
+    for (const item of items) {
+      const itemStoreId = item.store_id != null ? Number(item.store_id) : null;
+      let cannotDeliver = false;
+      let cannotDeliverReason = null;
+
+      if (deliveryAddress && deliveryAddress.latitude != null && deliveryAddress.longitude != null) {
+        if (activeStoreType === "branch") {
+          if (itemStoreId !== activeStoreId) {
+            cannotDeliver = true;
+            cannotDeliverReason = itemStoreId != null
+              ? `This item is from "${item.store_name || "another branch"}" and cannot be delivered to your selected address. Please remove it to continue.`
+              : `This item is from the Main Bakery and cannot be delivered to your selected address via "${activeStore?.name || "this branch"}". Please remove it to continue.`;
+          }
+        } else {
+          // Fulfilling store is Admin (Main Bakery)
+          if (itemStoreId != null) {
+            cannotDeliver = true;
+            cannotDeliverReason = `This item is from "${item.store_name || "a branch"}" and cannot be delivered to your selected address. Please remove it to continue.`;
+          } else if (maxDeliveryDistance > 0 && distanceKm != null && distanceKm > maxDeliveryDistance) {
+            cannotDeliver = true;
+            cannotDeliverReason = `Sorry, we cannot deliver to your selected address. Please choose a closer location or remove this item.`;
+          }
+        }
+      }
+
+      item.cannot_deliver = cannotDeliver;
+      item.cannot_deliver_reason = cannotDeliverReason;
+      item.is_deliverable = !cannotDeliver;
+
+      if (cannotDeliver) {
+        hasUndeliverableItems = true;
+        undeliverableItemsCount++;
+      }
+    }
+  }
+
+  isOutOfRange =
+    !activeCanDeliver ||
+    (maxDeliveryDistance > 0 && distanceKm != null && distanceKm > maxDeliveryDistance) ||
+    hasUndeliverableItems;
 
   // 5. Delivery Fee Calculation
   const freeDeliveryThreshold = roundCurrency(settings.free_delivery_threshold);
@@ -298,7 +368,7 @@ async function calculateCartAndOrderPricing({
   const isFreeDelivery =
     freeDeliveryThreshold > 0 && rawSubtotal >= freeDeliveryThreshold && rawSubtotal > 0;
 
-  const deliveryFee = rawSubtotal === 0 ? 0 : (isFreeDelivery ? 0 : baseDeliveryCharge);
+  const deliveryFee = rawSubtotal === 0 || isOutOfRange ? 0 : (isFreeDelivery ? 0 : baseDeliveryCharge);
   const freeDeliverySavings = isFreeDelivery ? baseDeliveryCharge : 0;
   const freeDeliveryShortfall =
     !isFreeDelivery && freeDeliveryThreshold > 0 && rawSubtotal > 0
@@ -329,8 +399,14 @@ async function calculateCartAndOrderPricing({
   // 7. Fees (Packaging, Platform, COD)
   const packagingFee = rawSubtotal > 0 ? roundCurrency(settings.packaging_fee) : 0;
   const platformFee = rawSubtotal > 0 ? roundCurrency(settings.platform_fee) : 0;
-  const isCod = true;
-  const codFee = rawSubtotal > 0 ? roundCurrency(settings.cod_fee) : 0;
+  
+  // Only charge COD fee if the user explicitly chooses Cash on Delivery
+  const isCod = Boolean(
+    paymentMethod &&
+      (String(paymentMethod).toLowerCase().includes("cash") ||
+        String(paymentMethod).toLowerCase().includes("cod"))
+  );
+  const codFee = (rawSubtotal > 0 && isCod) ? roundCurrency(settings.cod_fee) : 0;
 
   // 8. Grand Total
   let grandTotal = 0;
@@ -347,6 +423,58 @@ async function calculateCartAndOrderPricing({
       )
     );
   }
+
+  // -------------------------------------------------------------
+  // Store Settlement & Admin Commission Calculation
+  // ONLY for Branch Stores - Main Bakery has NO commission deduction
+  // -------------------------------------------------------------
+  const isBranchStore = activeStoreType === "branch" && Boolean(activeStoreId);
+  const storeCommissionType = settings.store_commission_type || "percent";
+  const storeCommissionValue = Number(settings.store_commission_value ?? 10);
+  const storeCommissionMinOrder = Number(settings.store_commission_min_order_amount ?? 0);
+
+  let storeGrossAmount = 0;
+  let adminCommissionAmount = 0;
+  let storePayableAmount = 0;
+
+  if (isBranchStore) {
+    // Store Gross = Product Price (after discounts) + Delivery Fee + Packaging Fee
+    storeGrossAmount = roundCurrency(discountedSubtotal + deliveryFee + packagingFee);
+
+    if (rawSubtotal >= storeCommissionMinOrder) {
+      if (storeCommissionType === "fixed") {
+        adminCommissionAmount = roundCurrency(storeCommissionValue);
+      } else {
+        adminCommissionAmount = roundCurrency((discountedSubtotal * storeCommissionValue) / 100);
+      }
+    }
+
+    // Ensure commission doesn't exceed store gross
+    adminCommissionAmount = Math.min(adminCommissionAmount, storeGrossAmount);
+    storePayableAmount = Math.max(0, storeGrossAmount - adminCommissionAmount);
+  }
+
+  // -------------------------------------------------------------
+  // Developer Commission & Tech Royalty Calculation (Admin Only)
+  // 1. 100% of customer platform_fee goes to developer.
+  // 2. Developer also gets a share of the Admin Commission on branch orders.
+  // -------------------------------------------------------------
+  const developerCommissionType = settings.developer_commission_type || "percent";
+  const developerCommissionValue = Number(settings.developer_commission_value ?? 25);
+
+  const developerPlatformFee = platformFee; // 100% of platform fee
+  let developerCommissionShare = 0;
+
+  if (isBranchStore && adminCommissionAmount > 0) {
+    if (developerCommissionType === "fixed") {
+      developerCommissionShare = Math.min(adminCommissionAmount, roundCurrency(developerCommissionValue));
+    } else {
+      developerCommissionShare = roundCurrency((adminCommissionAmount * developerCommissionValue) / 100);
+    }
+  }
+
+  const adminNetCommission = Math.max(0, adminCommissionAmount - developerCommissionShare);
+  const developerTotalEarnings = roundCurrency(developerPlatformFee + developerCommissionShare);
 
   // Timer / validity window
   const now = new Date();
@@ -392,6 +520,8 @@ async function calculateCartAndOrderPricing({
     distance_km: distanceKm,
     max_delivery_distance: maxDeliveryDistance,
     is_out_of_range: isOutOfRange,
+    has_undeliverable_items: hasUndeliverableItems,
+    undeliverable_count: undeliverableItemsCount,
 
     // Additional Fees
     packaging_fee: packagingFee,
@@ -408,8 +538,24 @@ async function calculateCartAndOrderPricing({
     grand_total: grandTotal,
 
     // Store Location snapshot
-    store_latitude: settings.store_latitude,
-    store_longitude: settings.store_longitude,
+    store_latitude: (activeStore && activeStore.latitude != null) ? Number(activeStore.latitude) : settings.store_latitude,
+    store_longitude: (activeStore && activeStore.longitude != null) ? Number(activeStore.longitude) : settings.store_longitude,
+
+    // Store Settlement & Admin Commission
+    store_gross_amount: storeGrossAmount,
+    admin_commission_amount: adminCommissionAmount,
+    store_payable_amount: storePayableAmount,
+    store_commission_type: storeCommissionType,
+    store_commission_value: storeCommissionValue,
+    store_commission_min_order_amount: storeCommissionMinOrder,
+
+    // Developer Royalty & Tech Earnings (Admin Only)
+    developer_platform_fee: developerPlatformFee,
+    developer_commission_share: developerCommissionShare,
+    developer_total_earnings: developerTotalEarnings,
+    admin_net_commission: adminNetCommission,
+    developer_commission_type: developerCommissionType,
+    developer_commission_value: developerCommissionValue,
 
     // Timer & Metadata
     currency: "INR",

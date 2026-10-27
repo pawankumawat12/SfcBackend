@@ -17,6 +17,7 @@ const {
   verifyToken,
   isAdmin,
 } = require("../../../middleware/auth.middleware");
+const { reviewSubmitLimiter } = require("../../../middleware/rateLimiter");
 
 function optionalVerifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -43,8 +44,8 @@ function optionalVerifyToken(req, res, next) {
 }
 
 // 1. Submit reviews (Authenticated customer)
-router.post("/product/:productId", verifyToken, createProductReview);
-router.post("/site", verifyToken, createSiteReview);
+router.post("/product/:productId", verifyToken, reviewSubmitLimiter, createProductReview);
+router.post("/site", verifyToken, reviewSubmitLimiter, createSiteReview);
 
 // 2. Edit & Delete own review (Authenticated customer or admin)
 router.put("/:id", verifyToken, updateReview);

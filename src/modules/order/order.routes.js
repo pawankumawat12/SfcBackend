@@ -1,7 +1,10 @@
 const express = require("express");
-const { verifyToken, isAdmin } = require("../../../middleware/auth.middleware");
+const { verifyToken, isAdmin, isAdminOrStoreOwner } = require("../../../middleware/auth.middleware");
 const {
   createOrder,
+  createPosSaleController,
+  getPosSalesHistoryController,
+  updatePosSaleController,
   getUserOrders,
   getOrderDetails,
   getAdminOrders,
@@ -12,6 +15,7 @@ const {
   refundOrderController,
   acceptOrderController,
   rejectOrderController,
+  forwardOrderToStoreHandler,
   verifyRazorpayPayment,
   retryPaymentController,
   bulkUpdateOrderStatusHandler,
@@ -19,6 +23,8 @@ const {
   downloadInvoiceHandler,
 } = require("./order.controller");
 const { handleRazorpayWebhook } = require("../webhook/webhook.controller");
+const { orderCreateLimiter } = require("../../../middleware/rateLimiter");
+const idempotencyMiddleware = require("../../../middleware/idempotency.middleware");
 
 const router = express.Router();
 
@@ -27,9 +33,12 @@ router.post("/webhook/razorpay", handleRazorpayWebhook);
 
 // Authenticated customer & admin routes
 router.use(verifyToken);
+router.post("/pos/sale", isAdminOrStoreOwner, createPosSaleController);
+router.get("/pos/history", isAdminOrStoreOwner, getPosSalesHistoryController);
+router.put("/pos/sale/:id", isAdminOrStoreOwner, updatePosSaleController);
 router.get("/export", isAdmin, exportOrdersHandler);
 router.post("/bulk-status", isAdmin, bulkUpdateOrderStatusHandler);
-router.post("/", createOrder);
+router.post("/", orderCreateLimiter, idempotencyMiddleware, createOrder);
 router.post("/verify-payment", verifyRazorpayPayment);
 router.post("/:id/retry-payment", retryPaymentController);
 router.get("/:id/invoice", downloadInvoiceHandler);
@@ -37,14 +46,17 @@ router.get("/", getUserOrders);
 router.get("/:id", getOrderDetails);
 router.post("/:id/cancel", cancelUserOrder);
 
-// Admin order management routes
-router.get("/admin/all", isAdmin, getAdminOrders);
-router.patch("/:id/status", isAdmin, updateStatus);
-router.post("/:id/accept", isAdmin, acceptOrderController);
-router.post("/:id/reject", isAdmin, rejectOrderController);
+// Admin & Store Owner order management routes
+router.get("/admin/all", isAdminOrStoreOwner, getAdminOrders);
+router.patch("/:id/status", isAdminOrStoreOwner, updateStatus);
+router.post("/:id/accept", isAdminOrStoreOwner, acceptOrderController);
+router.post("/:id/reject", isAdminOrStoreOwner, rejectOrderController);
+router.patch("/items/:itemId/produced", isAdminOrStoreOwner, markItemProduced);
+
+// Admin-only order routing and financials
+router.post("/:id/forward-to-store", isAdmin, forwardOrderToStoreHandler);
 router.patch("/:id/payment-status", isAdmin, updatePaymentStatusController);
 router.post("/:id/refund", isAdmin, refundOrderController);
-router.patch("/items/:itemId/produced", isAdmin, markItemProduced);
 
 module.exports = router;
 

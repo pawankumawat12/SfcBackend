@@ -1,4 +1,5 @@
 const ContactModel = require("../../models/contact.model");
+const { normalizeIndianPhone } = require("../../utils/phone.util");
 const {
   validateContactSubmission,
   validateStatusUpdate,
@@ -20,12 +21,13 @@ async function submitContactQuery(req, res) {
 
     const { name, email, phone, subject, message } = req.body;
     const userId = req.user?.id || null;
+    const cleanPhone = phone ? normalizeIndianPhone(phone) : null;
 
     const newQuery = await ContactModel.createQuery({
       user_id: userId,
       name: name.trim(),
       email: email.trim().toLowerCase(),
-      phone: phone ? phone.trim() : null,
+      phone: cleanPhone,
       subject: subject.trim(),
       message: message.trim(),
     });
@@ -40,7 +42,7 @@ async function submitContactQuery(req, res) {
       dataJson: {
         queryId: newQuery.id,
         email: email.trim().toLowerCase(),
-        phone: phone ? phone.trim() : null,
+        phone: cleanPhone,
       },
     }).catch((err) => console.error("Admin contact notification error:", err));
 

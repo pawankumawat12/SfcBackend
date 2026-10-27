@@ -1,3 +1,5 @@
+const { isValidIndianPhone } = require("../../utils/phone.util");
+
 /**
  * Validate customer contact form submission
  */
@@ -26,9 +28,8 @@ function validateContactSubmission(body) {
 
   // Phone (optional or valid format)
   if (phone && typeof phone === "string" && phone.trim()) {
-    const cleanedPhone = phone.trim().replace(/[\s\-()]/g, "");
-    if (!/^\+?[0-9]{7,15}$/.test(cleanedPhone)) {
-      errors.push("Please provide a valid phone number (7 to 15 digits)");
+    if (!isValidIndianPhone(phone)) {
+      errors.push("Please provide a valid 10-digit Indian phone number");
     }
   }
 

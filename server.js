@@ -50,6 +50,14 @@ async function startServer() {
     console.warn("[Server] Failed to start chat cleanup cron:", cleanupErr.message);
   }
 
+  // Initialize background WhatsApp automated alert client
+  try {
+    const { initWhatsAppClient } = require("./src/services/whatsapp.service");
+    initWhatsAppClient();
+  } catch (waErr) {
+    console.warn("[Server] Failed to initialize WhatsApp service:", waErr.message);
+  }
+
   httpServer.listen(PORT, () => {
     console.log(`Server and Socket.IO running on port ${PORT}`);
   });

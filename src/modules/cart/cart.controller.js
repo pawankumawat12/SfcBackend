@@ -7,8 +7,14 @@ const {
   removeCartItem,
   clearCart,
 } = require("../../models/cart.model");
-const { getAddressesByUserId, getAddressById } = require("../../models/address.model");
-const { calculateCartAndOrderPricing, roundCurrency } = require("../../utils/pricing.util");
+const {
+  getAddressesByUserId,
+  getAddressById,
+} = require("../../models/address.model");
+const {
+  calculateCartAndOrderPricing,
+  roundCurrency,
+} = require("../../utils/pricing.util");
 
 function parsePositiveInteger(value) {
   const parsed = Number(value);
@@ -38,12 +44,20 @@ function formatCartItems(rawItems) {
     const availabilityType = item.availability_type || "IN_STOCK";
     const isMadeToOrder = availabilityType === "MADE_TO_ORDER";
 
+    // Store active/closure check — only applies to store-specific products (store_id set)
+    const storeIsClosed = item.store_id ? item.store_is_open === false : false;
+    const storeIsInactive = item.store_id
+      ? item.store_is_active === false
+      : false;
+
     const isOutOfStock = !item.is_active || (!isMadeToOrder && stock <= 0);
     const exceedsStock = !isMadeToOrder && quantity > stock;
     const isMaxStockReached = !isMadeToOrder && quantity >= stock && stock > 0;
 
     let stockMessage = null;
-    if (!item.is_active) {
+    if (storeIsInactive || storeIsClosed) {
+      stockMessage = "Not available right now";
+    } else if (!item.is_active) {
       stockMessage = "Unavailable";
     } else if (isMadeToOrder) {
       stockMessage = "Made to Order";
@@ -71,14 +85,20 @@ function formatCartItems(rawItems) {
       images,
       image: images[0] || null,
       is_active: Boolean(item.is_active),
+      store_id: item.store_id || null,
+      store_name: item.store_name || null,
+      store_is_closed: storeIsClosed,
       category_id: item.category_id,
       category_name: item.category_name || "Menu",
       quantity,
       itemTotal,
-      isOutOfStock,
+      isOutOfStock: isOutOfStock || storeIsClosed,
       exceedsStock,
       isMaxStockReached,
       stockMessage,
+      cannot_deliver: Boolean(item.cannot_deliver),
+      cannot_deliver_reason: item.cannot_deliver_reason || null,
+      is_deliverable: item.is_deliverable !== false && !item.cannot_deliver,
       added_at: item.added_at,
       updated_at: item.updated_at,
     };
@@ -89,10 +109,14 @@ function buildCartSummary(pricing, enrichedItems) {
   const stockProblemItems = enrichedItems.filter(
     (it) => it.isOutOfStock || it.exceedsStock
   );
+  const undeliverableItems = enrichedItems.filter(
+    (it) => it.cannot_deliver
+  );
 
   return {
     totalItems: pricing.total_items,
-    totalProductsDelivered: pricing.total_products_delivered ?? pricing.total_items,
+    totalProductsDelivered:
+      pricing.total_products_delivered ?? pricing.total_items,
     totalQuantity: pricing.total_items,
     cartQuantity: pricing.paid_items ?? pricing.total_items,
     normalCartQuantity: pricing.paid_items ?? pricing.total_items,
@@ -124,6 +148,8 @@ function buildCartSummary(pricing, enrichedItems) {
     distanceKm: pricing.distance_km,
     maxDeliveryDistance: pricing.max_delivery_distance,
     isOutOfRange: pricing.is_out_of_range,
+    hasUndeliverableItems: undeliverableItems.length > 0 || Boolean(pricing.has_undeliverable_items),
+    undeliverableCount: undeliverableItems.length || pricing.undeliverable_count || 0,
 
     packagingFee: pricing.packaging_fee,
     platformFee: pricing.platform_fee,
@@ -155,16 +181,24 @@ async function respondWithCart(res, userId, message = "Success", options = {}) {
   if (options.addressId) {
     deliveryAddress = await getAddressById(options.addressId, userId);
   }
+  if (!deliveryAddress && options.lat != null && options.lng != null && !isNaN(options.lat) && !isNaN(options.lng)) {
+    deliveryAddress = {
+      latitude: Number(options.lat),
+      longitude: Number(options.lng),
+      formatted_address: "Selected Location",
+    };
+  }
   if (!deliveryAddress) {
     const userAddresses = await getAddressesByUserId(userId);
-    deliveryAddress = userAddresses.find((a) => a.is_default) || userAddresses[0] || null;
+    deliveryAddress =
+      userAddresses.find((a) => a.is_default) || userAddresses[0] || null;
   }
 
   // Calculate pricing completely on the backend
   const pricing = await calculateCartAndOrderPricing({
     items,
     deliveryAddress,
-    paymentMethod: options.paymentMethod || "Cash on Delivery",
+    paymentMethod: options.paymentMethod || "Online Payment",
     offerCode: options.offerCode || null,
   });
 
@@ -187,13 +221,22 @@ async function respondWithCart(res, userId, message = "Success", options = {}) {
 async function getCart(req, res) {
   try {
     const addressId = req.query.addressId ? Number(req.query.addressId) : null;
-    const paymentMethod = req.query.paymentMethod || "Cash on Delivery";
+    const lat = req.query.lat != null ? Number(req.query.lat) : null;
+    const lng = req.query.lng != null ? Number(req.query.lng) : null;
+    const paymentMethod = req.query.paymentMethod || "Online Payment";
     const offerCode = req.query.offerCode || req.query.code || null;
-    return await respondWithCart(res, req.user.id, "Cart fetched successfully", {
-      addressId,
-      paymentMethod,
-      offerCode,
-    });
+    return await respondWithCart(
+      res,
+      req.user.id,
+      "Cart fetched successfully",
+      {
+        addressId,
+        lat,
+        lng,
+        paymentMethod,
+        offerCode,
+      }
+    );
   } catch (error) {
     console.error("Get cart error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -218,6 +261,20 @@ async function addCartItem(req, res) {
         success: false,
         message: "This product is currently not available",
       });
+    }
+
+    // Block add-to-cart if the product belongs to an INACTIVE or CLOSED store
+    if (product.store_id) {
+      const store = await db("stores").where({ id: product.store_id }).first();
+      if (store && (!store.is_active || !store.is_open)) {
+        return res.status(400).json({
+          success: false,
+          message: "This product is not available right now.",
+          storeClosed: !store.is_open,
+          storeInactive: !store.is_active,
+          storeName: store.name || null,
+        });
+      }
     }
 
     const isMadeToOrder = product.availability_type === "MADE_TO_ORDER";
@@ -280,12 +337,35 @@ async function updateCartItem(req, res) {
       return await respondWithCart(res, req.user.id, "Item removed from cart");
     }
 
+    const current = await findCartItem(req.user.id, productId);
+    const currentQty = Number(current?.quantity) || 0;
+
+    // If user is reducing quantity or removing items, ALWAYS allow it!
+    if (quantity < currentQty) {
+      await upsertCartItem(req.user.id, productId, quantity);
+      return await respondWithCart(res, req.user.id, "Cart item updated");
+    }
+
     const product = await findProductById(productId);
     if (!product || !product.is_active) {
       return res.status(404).json({
         success: false,
         message: "Product is not available",
       });
+    }
+
+    // Only block if INCREASING quantity for an INACTIVE or CLOSED store
+    if (product.store_id) {
+      const store = await db("stores").where({ id: product.store_id }).first();
+      if (store && (!store.is_active || !store.is_open)) {
+        return res.status(400).json({
+          success: false,
+          message: "This product is not available right now.",
+          storeClosed: !store.is_open,
+          storeInactive: !store.is_active,
+          storeName: store.name || null,
+        });
+      }
     }
 
     const isMadeToOrder = product.availability_type === "MADE_TO_ORDER";
@@ -383,9 +463,14 @@ async function getGuestCartPreview(req, res) {
         "products.images",
         "products.is_active",
         "products.category_id",
+        "products.store_id",
         "categories.name as category_name",
+        "stores.name as store_name",
+        "stores.is_open as store_is_open",
+        "stores.is_active as store_is_active",
       ])
       .leftJoin("categories", "products.category_id", "categories.id")
+      .leftJoin("stores", "products.store_id", "stores.id")
       .whereIn("products.id", productIds);
 
     const productMap = new Map(products.map((p) => [Number(p.product_id), p]));
@@ -403,11 +488,19 @@ async function getGuestCartPreview(req, res) {
       });
     }
 
+    const lat = req.body?.lat != null ? Number(req.body.lat) : null;
+    const lng = req.body?.lng != null ? Number(req.body.lng) : null;
+    const guestDeliveryAddress =
+      lat != null && lng != null && !isNaN(lat) && !isNaN(lng)
+        ? { latitude: lat, longitude: lng, formatted_address: "Selected Location" }
+        : null;
+
+    const paymentMethod = req.body?.paymentMethod || "Online Payment";
     const formattedItems = formatCartItems(populatedItems);
     const pricing = await calculateCartAndOrderPricing({
       items: formattedItems,
-      deliveryAddress: null,
-      paymentMethod: "Cash on Delivery",
+      deliveryAddress: guestDeliveryAddress,
+      paymentMethod,
       offerCode,
     });
 
@@ -421,7 +514,7 @@ async function getGuestCartPreview(req, res) {
         items: enrichedItems,
         summary,
         pricing,
-        deliveryAddress: null,
+        deliveryAddress: guestDeliveryAddress,
       },
     });
   } catch (error) {
@@ -510,7 +603,10 @@ async function mergeGuestCart(req, res) {
     });
 
     let message = "Cart merged successfully";
-    if (mergeReport.adjustedItems.length > 0 || mergeReport.outOfStockItems.length > 0) {
+    if (
+      mergeReport.adjustedItems.length > 0 ||
+      mergeReport.outOfStockItems.length > 0
+    ) {
       message = "Cart merged with stock adjustments";
     }
 
@@ -519,7 +615,9 @@ async function mergeGuestCart(req, res) {
     });
   } catch (error) {
     console.error("Merge cart error:", error);
-    return res.status(500).json({ success: false, message: "Failed to merge cart" });
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to merge cart" });
   }
 }
 
