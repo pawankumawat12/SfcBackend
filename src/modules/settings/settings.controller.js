@@ -14,6 +14,10 @@ const {
   updateStoreStatusSettings,
   getPaymentSettings,
   updatePaymentSettings,
+  getDynamicQrSettings,
+  updateDynamicQrSettings,
+  getDeveloperSettings,
+  updateDeveloperSettings,
 } = require("../../models/settings.model");
 const { generateQrSvg, generateQrDataUrl } = require("../../services/qrCode.service");
 const { testResendConnection, sendMail } = require("../../services/resend.service");
@@ -846,4 +850,11 @@ module.exports = {
   updateStoreStatus,
   getPayment,
   updatePayment,
+  getDynamicQr,
+  updateDynamicQr,
+  downloadDynamicQr,
+  handleQrRedirect,
+  getPublicQrDestination,
+  getDeveloper,
+  updateDeveloper,
 };

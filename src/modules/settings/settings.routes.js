@@ -21,6 +21,13 @@ const {
   updateStoreStatus,
   getPayment,
   updatePayment,
+  getDynamicQr,
+  updateDynamicQr,
+  downloadDynamicQr,
+  handleQrRedirect,
+  getPublicQrDestination,
+  getDeveloper,
+  updateDeveloper,
 } = require("./settings.controller");
 
 const router = express.Router();
